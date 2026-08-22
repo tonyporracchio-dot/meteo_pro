@@ -11,11 +11,11 @@
     <meta name="apple-mobile-web-app-title" content="Meteo Pro">
     
     <!-- PWA Manifest Inline -->
-    <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Meteo%20Pro%22%2C%22short_name%22%3A%22MeteoPro%22%2C%22description%22%3A%22App%20meteo%20professionale%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230f172a%22%2C%22theme_color%22%3A%22%230f172a%22%2C%22icons%22%3A%5B%7B%22src%22%3A%22https%3A%2F%2Fcdn-icons-png.flaticon.com%2F512%2F1163%2F1163661.png%22%2C%22sizes%22%3A%22512x512%22%2C%22type%22%3A%22image%2Fpng%22%7D%5D%7D">
+    <link rel="manifest" href="data:application/manifest+json;charset=utf-8,%7B%22name%22%3A%22Meteo%20Pro%22%2C%22short_name%22%3A%22MeteoPro%22%2C%22description%22%3A%22App%20meteo%20professionale%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230f172a%22%2C%22theme_color%22%3A%22%230f172a%22%2C%22icons%22%3A%5B%7B%22src%22%3A%22icon.png%22%2C%22sizes%22%3A%22512x512%22%2C%22type%22%3A%22image%2Fpng%22%7D%5D%7D">
 
     <!-- Favicon and App Icons -->
-    <link rel="icon" type="image/png" href="https://cdn-icons-png.flaticon.com/512/1163/1163661.png">
-    <link rel="apple-touch-icon" href="https://cdn-icons-png.flaticon.com/512/1163/1163661.png">
+    <link rel="icon" type="image/png" href="icon.png">
+    <link rel="apple-touch-icon" href="icon.png">
 
     <!-- Theme Color for Status Bar -->
     <meta name="theme-color" content="#0f172a" id="themeColorMeta">
@@ -42,6 +42,21 @@
         }
     </script>
     <style>
+        html {
+            background-color: #030712; /* Corrispondente a bg-slate-950 */
+            height: 100%;
+            overflow-x: hidden;
+        }
+
+        body { 
+            font-family: 'Inter', sans-serif; 
+            -webkit-tap-highlight-color: transparent;
+            padding-top: env(safe-area-inset-top);
+            background-color: #030712;
+            min-height: 100%;
+            overscroll-behavior-y: none; /* Blocca l'effetto bounce bianco su iOS */
+        }
+
         ::-webkit-scrollbar { height: 4px; width: 4px; }
         ::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.05); }
         ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.25); border-radius: 9999px; }
