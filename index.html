@@ -230,6 +230,26 @@
             </div>
         </div>
 
+        <!-- Rare Severe Hail Alert Card (>4 cm) -->
+        <div id="rareHailAlertCard" class="hidden glass-panel rounded-2xl p-2.5 sm:p-3 border border-red-500/70 bg-gradient-to-r from-red-600/35 via-rose-700/25 to-red-600/35 shadow-xl text-red-200 text-xs sm:text-sm flex items-center gap-2.5">
+            <div class="p-2 bg-red-500/40 rounded-xl text-red-200 shrink-0">
+                <svg class="w-5 h-5 sm:w-6 sm:h-6 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+                </svg>
+            </div>
+            <div class="flex-1 min-w-0">
+                <div class="flex items-center justify-between">
+                    <p class="font-extrabold text-red-100 flex items-center gap-1.5">
+                        <span>⚠️ Possibile evento raro con grandine >4 cm</span>
+                    </p>
+                    <button onclick="toggleHailDebugModal()" class="text-[10px] bg-red-500/40 hover:bg-red-500/60 text-red-100 px-2 py-0.5 rounded-lg border border-red-300/40 font-semibold transition">Parametri</button>
+                </div>
+                <div id="rareHailAlertText" class="text-xs text-red-200/95 font-medium leading-snug mt-0.5 space-y-0.5">
+                    Condizioni estreme favorevoli a grandine gigante (>4 cm).
+                </div>
+            </div>
+        </div>
+
         <!-- Today's Hourly Horizontal Timeline -->
         <section class="glass-panel rounded-2xl p-3 shadow-lg">
             <h2 class="text-xs font-semibold text-sky-200 uppercase tracking-wider mb-2 flex items-center justify-between">
@@ -492,7 +512,8 @@
 
             if (precip < 0.5) return {
                 probability: 0, hsr_raw: 0, hsr_final: 0, hail_level: "none", label: "Nessuna grandine", estSize: 0, storm_state: "none", isStormActive: false,
-                breakdown: { cape_n: 0, shear_n: 0, frz_n: 0, lr_n: 0, cin_n: 0, shear_0_6km: fallback_shear, lapse_rate: 6.0, frz_level: freezing_level !== undefined ? freezing_level : 4400, storm_state: "none", storm_factor: 0, structure_factor: 0 }
+                rare_event: { flag: false, level: "none", index: 0, potential_size: null },
+                breakdown: { cape_n: 0, shear_n: 0, frz_n: 0, lr_n: 0, cin_n: 0, shear_0_6km: fallback_shear, lapse_rate: 6.0, frz_level: freezing_level !== undefined ? freezing_level : 4400, storm_state: "none", storm_factor: 0, structure_factor: 0, rare_event: { flag: false, level: "none", index: 0, potential_size: null } }
             };
 
             let shear_0_6km = fallback_shear;
@@ -508,6 +529,59 @@
 
             let frz_level = freezing_level !== undefined ? freezing_level : 4400;
             const storm_state = (p => p < 0.5 ? "none" : p < 2 ? "weak" : p < 7 ? "moderate" : "strong")(precip);
+            const isStormActive = precip >= 1;
+
+            // STEP 1 — CALCOLO INDICE EVENTO RARO
+            const rareIndex = (() => {
+              let score = 0;
+
+              // Energia
+              if (cape > 2000) score += 1;
+              if (cape > 3000) score += 1;
+
+              // Shear (fondamentale)
+              if (shear_0_6km > 18) score += 1;
+              if (shear_0_6km > 22) score += 1;
+
+              // Instabilità verticale
+              if (lapse_rate > 6.5) score += 1;
+              if (lapse_rate > 7.2) score += 1;
+
+              // Freezing level favorevole
+              if (frz_level < 4200) score += 1;
+              if (frz_level < 3800) score += 1;
+
+              return score; // range 0–8
+            })();
+
+            // STEP 2 — CLASSIFICAZIONE EVENTO RARO
+            const rareLevel = (() => {
+              if (rareIndex >= 7) return "extreme";
+              if (rareIndex >= 5) return "high";
+              if (rareIndex >= 3) return "elevated";
+              return "none";
+            })();
+
+            // STEP 3 — FILTRO TEMPORALE REALE
+            let rareFlag = false;
+
+            if (
+              precip >= 2 &&           // temporale reale
+              isStormActive &&         // già presente nel tuo codice
+              rareLevel !== "none"
+            ) {
+              rareFlag = true;
+            }
+
+            // STEP 4 — STIMA GRANDINE ESTREMA
+            let extremeHailSize = null;
+
+            if (rareFlag) {
+              if (rareLevel === "extreme") extremeHailSize = 6.0;   // 6+ cm
+              else if (rareLevel === "high") extremeHailSize = 4.5; // 4–5 cm
+              else extremeHailSize = 3.5;
+            }
+
             const CAPE_n = (c => c < 500 ? 0 : c < 1000 ? 0.3 : c < 2000 ? 0.6 : c < 3000 ? 0.8 : 1.0)(cape);
             const SHEAR_n = (s => s < 10 ? 0.1 : s < 20 ? 0.5 : s < 30 ? 0.8 : 1.0)(shear_0_6km);
             const FRZ_n = (f => f > 4500 ? 0.05 : f > 4200 ? 0.2 : f > 3800 ? 0.5 : f > 3500 ? 0.8 : 1.0)(frz_level);
@@ -534,8 +608,24 @@
 
             return {
                 probability: Math.round(hsr * 100), hsr_raw, hsr_final: hsr, hail_level: result.level, label: result.label,
-                estSize: result.estSize, storm_state, isStormActive: precip >= 1,
-                breakdown: { cape_n: CAPE_n, shear_n: SHEAR_n, frz_n: FRZ_n, lr_n: LR_n, cin_n: CIN_n, shear_0_6km: Number(shear_0_6km.toFixed(1)), lapse_rate: Number(lapse_rate.toFixed(2)), frz_level: Math.round(frz_level), storm_state, storm_factor: s_factor, structure_factor: struct_factor }
+                estSize: result.estSize, storm_state, isStormActive,
+                rare_event: {
+                  flag: rareFlag,
+                  level: rareLevel,
+                  index: rareIndex,
+                  potential_size: extremeHailSize
+                },
+                breakdown: {
+                    cape_n: CAPE_n, shear_n: SHEAR_n, frz_n: FRZ_n, lr_n: LR_n, cin_n: CIN_n,
+                    shear_0_6km: Number(shear_0_6km.toFixed(1)), lapse_rate: Number(lapse_rate.toFixed(2)),
+                    frz_level: Math.round(frz_level), storm_state, storm_factor: s_factor, structure_factor: struct_factor,
+                    rare_event: {
+                      flag: rareFlag,
+                      level: rareLevel,
+                      index: rareIndex,
+                      potential_size: extremeHailSize
+                    }
+                }
             };
         }
 
@@ -914,12 +1004,15 @@
         }
 
         let lastEvaluatedHailResult = null;
+        let lastEvaluatedRareEvent = null;
         function checkHailAlertAlgorithm(data) {
             const alertCard = document.getElementById('hailAlertCard'), alertText = document.getElementById('hailAlertText');
+            const rareCard = document.getElementById('rareHailAlertCard'), rareText = document.getElementById('rareHailAlertText');
             if (!alertCard || !alertText || !data || !data.hourly) return;
             const now = new Date(); const currentHourIndex = now.getHours();
             const cutoff = Math.min(currentHourIndex + 48, data.hourly.time.length);
             let maxProb = 0; let peakObj = null;
+            let peakRareObj = null;
 
             for (let i = currentHourIndex; i < cutoff; i++) {
                 const cape = data.hourly.cape ? (data.hourly.cape[i] || 0) : 0;
@@ -947,9 +1040,18 @@
 
                 const hailRes = calculateHailIndex({ cape, cin, u850, v850, u500, v500, t700, t500, z700, z500, freezing_level: freezing, precip, fallback_shear });
                 if (hailRes.hsr_final > maxProb) { maxProb = hailRes.hsr_final; peakObj = { index: i, date: new Date(data.hourly.time[i]), cape, cin, precip, result: hailRes }; }
+
+                if (hailRes.rare_event && hailRes.rare_event.flag) {
+                    if (!peakRareObj || hailRes.rare_event.index > peakRareObj.result.rare_event.index || (hailRes.rare_event.potential_size || 0) > (peakRareObj.result.rare_event.potential_size || 0)) {
+                        peakRareObj = { index: i, date: new Date(data.hourly.time[i]), cape, cin, precip, result: hailRes };
+                    }
+                }
             }
 
             lastEvaluatedHailResult = peakObj;
+            lastEvaluatedRareEvent = peakRareObj;
+
+            // Alert Rischio Grandine Standard (HSR)
             if (maxProb >= 0.35 && peakObj) {
                 const timeStr = peakObj.date.toLocaleDateString('it-IT', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
                 alertText.innerHTML = `<p class="font-semibold text-amber-100">Picco stimato: <span class="text-white">${timeStr}</span> (HSR: <span class="text-white font-bold">${Math.round(maxProb * 100)}%</span>)</p>
@@ -957,13 +1059,31 @@
                 alertCard.querySelector('.font-bold span').innerText = maxProb >= 0.75 ? "🚨 ALTO RISCHIO GRANDINE!" : "⚠️ ALLERTA RISCHIO GRANDINE";
                 alertCard.classList.remove('hidden');
             } else { alertCard.classList.add('hidden'); }
+
+            // Alert Separato Evento Raro (>4 cm)
+            if (rareCard && rareText) {
+                if (peakRareObj && peakRareObj.result.rare_event && peakRareObj.result.rare_event.flag) {
+                    const rTimeStr = peakRareObj.date.toLocaleDateString('it-IT', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+                    const rEvt = peakRareObj.result.rare_event;
+                    const levelBadge = rEvt.level === "extreme" ? "ESTREMO" : (rEvt.level === "high" ? "ALTO" : "ELEVATO");
+                    rareText.innerHTML = `
+                        <p class="font-bold text-red-100">Finestra stimata: <span class="text-white">${rTimeStr}</span> (Livello: <span class="text-white font-extrabold uppercase">${levelBadge} - ${rEvt.index}/8</span>)</p>
+                        <p class="text-red-200/95 font-medium">Potenziale chicchi: <span class="text-white font-extrabold">~${rEvt.potential_size} cm</span> - Condizioni per supercella / grandine distruttiva.</p>
+                    `;
+                    rareCard.classList.remove('hidden');
+                } else {
+                    rareCard.classList.add('hidden');
+                }
+            }
         }
 
         function toggleHailDebugModal() {
             const modal = document.getElementById('hailDebugModal');
             if (modal.classList.contains('hidden')) {
-                if (lastEvaluatedHailResult) {
-                    const r = lastEvaluatedHailResult, res = r.result, brk = res.breakdown;
+                const targetObj = lastEvaluatedRareEvent || lastEvaluatedHailResult;
+                if (targetObj) {
+                    const r = targetObj, res = r.result, brk = res.breakdown;
+                    const rare = res.rare_event || { flag: false, level: "none", index: 0, potential_size: null };
                     document.getElementById('hailDebugContent').innerHTML = `
                         <div class="bg-white/5 p-3 rounded-xl border border-white/10 space-y-2">
                             <p class="font-bold text-amber-300 text-sm">Dettagli HSR (Hail Size Risk v3) per il picco:</p>
@@ -972,7 +1092,7 @@
                             <p><b>Diametro Stimato:</b> <span class="text-white font-bold">~${res.estSize} cm</span></p>
                             <hr class="border-white/10 my-1">
                             <p class="font-semibold text-sky-200">Componenti Normalizzati (0-1):</p>
-                            <ul class="list-disc pl-4 space-y-1 text-slate-200">
+                            <ul class="list-disc pl-4 space-y-1 text-slate-200 text-xs">
                                 <li><b>CAPE Score:</b> ${brk.cape_n.toFixed(2)} (MUCAPE: ${Math.round(r.cape)} J/kg)</li>
                                 <li><b>Shear Score:</b> ${brk.shear_n.toFixed(2)} (0-6km: ${brk.shear_0_6km} m/s)</li>
                                 <li><b>Freezing Score:</b> ${brk.frz_n.toFixed(2)} (Quota zero termico: ${brk.frz_level} m)</li>
@@ -980,10 +1100,17 @@
                                 <li><b>CIN Moltiplicatore:</b> ${brk.cin_n.toFixed(2)} (Inibizione: ${Math.round(r.cin)} J/kg)</li>
                             </ul>
                             <p class="font-semibold text-sky-200 mt-2">Dinamica Cella (HSR v3):</p>
-                            <ul class="list-disc pl-4 space-y-1 text-slate-200">
+                            <ul class="list-disc pl-4 space-y-1 text-slate-200 text-xs">
                                 <li><b>Precipitazione Prevista:</b> ${r.precip.toFixed(1)} mm/h</li>
                                 <li><b>Stato Temporale:</b> <span class="uppercase">${brk.storm_state}</span> (Fattore: x${brk.storm_factor.toFixed(2)})</li>
                                 <li><b>Fattore Struttura:</b> x${brk.structure_factor.toFixed(2)}</li>
+                            </ul>
+                            <hr class="border-white/10 my-1">
+                            <p class="font-semibold text-rose-300">Indicatore Evento Raro (>4 cm):</p>
+                            <ul class="list-disc pl-4 space-y-1 text-slate-200 text-xs">
+                                <li><b>Stato Flag:</b> ${rare.flag ? '<span class="text-red-400 font-bold uppercase">ATTIVO ⚠️ (Evento Raro)</span>' : '<span class="text-slate-400">Non attivo</span>'}</li>
+                                <li><b>Indice Raro (Score):</b> ${rare.index}/8 (<span class="uppercase font-semibold">${rare.level}</span>)</li>
+                                <li><b>Stima Grandine Estrema:</b> ${rare.potential_size ? `<span class="text-amber-300 font-bold">~${rare.potential_size} cm</span>` : '<span class="text-slate-400">Nessuna (>4 cm non previsto)</span>'}</li>
                             </ul>
                         </div>`;
                 } else { document.getElementById('hailDebugContent').innerHTML = `<p class="text-slate-300">Nessun dato di instabilità rilevato per le prossime 48 ore.</p>`; }
