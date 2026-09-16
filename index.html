@@ -280,6 +280,7 @@
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/>
                     </svg>
                     Radar Precipitazioni
+                    <span class="text-[10px] font-normal normal-case bg-white/10 px-1.5 py-0.5 rounded-md border border-white/20 text-sky-200/90" title="Mosaico radar composito europeo, aggiornato ogni ~10 minuti">RainViewer</span>
                 </h2>
                 <div class="flex items-center gap-1.5">
                     <button id="radarZoomIn" title="Ingrandisci zoom" class="w-7 h-7 bg-white/10 hover:bg-white/20 active:scale-95 rounded-lg border border-white/20 text-white font-extrabold text-sm flex items-center justify-center transition">+</button>
@@ -311,7 +312,9 @@
             </div>
         </section>
 
+
     </div>
+
 
     <!-- Modale Località Salvate -->
     <div id="savedLocationsModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 hidden flex items-center justify-center p-4 transition-opacity duration-300">
@@ -625,9 +628,219 @@
                       index: rareIndex,
                       potential_size: extremeHailSize
                     }
-                }
+                },
+                cape // riesposto per il modulo di fusione (soglia CAPE basso)
             };
         }
+
+        // ============================================================
+        // MODULO RADAR — HSR_RADAR
+        // Campiona il dBZ reale dai tile radar (schema colore "Universal
+        // Blue" di RainViewer, mosaico europeo che integra i radar
+        // nazionali incl. rete ARPA): il canale rosso del PNG codifica
+        // il dBZ 1:1 (valore pixel 1 = -31 dBZ ... 127 = 95 dBZ; bit 128
+        // = neve). Non esiste un'API pubblica ARPA Lombardia con valori
+        // puntuali dBZ interrogabile da browser, quindi si usa questa
+        // fonte, che è la stessa già caricata per la mappa radar.
+        // ============================================================
+        const RADAR_SAMPLE_ZOOM = 7; // combacia con maxNativeZoom dei tile già in uso
+        const radarTileCache = new Map(); // path|z|x|y -> ImageData | null (per singola analisi)
+
+        function latLonToTileZXY(lat, lon, zoom) {
+            const latRad = lat * Math.PI / 180;
+            const n = Math.pow(2, zoom);
+            const xTileF = (lon + 180) / 360 * n;
+            const yTileF = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n;
+            const x = Math.floor(xTileF), y = Math.floor(yTileF);
+            const px = Math.floor((xTileF - x) * 256), py = Math.floor((yTileF - y) * 256);
+            return { z: zoom, x, y, px: Math.min(255, Math.max(0, px)), py: Math.min(255, Math.max(0, py)) };
+        }
+
+        function dbzFromRedChannel(r) {
+            if (r === 0) return null; // no data
+            const isSnow = (r & 128) === 128;
+            const raw = r & 127;
+            return raw - 32; // 1 -> -31 dBZ ... 127 -> 95 dBZ
+        }
+
+        let radarTileReadBlocked = false; // true se il browser blocca la lettura pixel (CORS/tainted canvas)
+        let radarTileReadOk = false;      // true se almeno una lettura pixel è riuscita
+
+        async function fetchTileImageData(host, path, z, x, y) {
+            const key = `${path}|${z}|${x}|${y}`;
+            if (radarTileCache.has(key)) return radarTileCache.get(key);
+            const url = `${host}${path}/256/${z}/${x}/${y}/2/1_0.png`; // colore 2 = Universal Blue, no smoothing per leggere i dBZ reali
+            try {
+                const imgData = await new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.crossOrigin = 'anonymous';
+                    img.onload = () => {
+                        try {
+                            const canvas = document.createElement('canvas');
+                            canvas.width = 256; canvas.height = 256;
+                            const ctx = canvas.getContext('2d');
+                            ctx.drawImage(img, 0, 0);
+                            const data = ctx.getImageData(0, 0, 256, 256);
+                            radarTileReadOk = true;
+                            resolve(data);
+                        } catch (e) {
+                            if (e && (e.name === 'SecurityError' || /tainted|cross-origin|insecure/i.test(e.message || ''))) {
+                                radarTileReadBlocked = true;
+                            }
+                            reject(e);
+                        }
+                    };
+                    img.onerror = reject;
+                    img.src = url;
+                });
+                radarTileCache.set(key, imgData);
+                return imgData;
+            } catch (e) {
+                radarTileCache.set(key, null);
+                return null;
+            }
+        }
+
+        // Griglia di campionamento attorno al punto: 5x5 punti ogni ~4.5 km (~18x18 km)
+        function buildSampleGridOffsetsKm() {
+            const offsets = [];
+            const steps = [-9, -4.5, 0, 4.5, 9];
+            steps.forEach(dx => steps.forEach(dy => offsets.push({ dx, dy })));
+            return offsets;
+        }
+
+        async function analyzeRadarField(lat, lon) {
+            if (!radarHost || !radarFrameMeta || radarFrameMeta.length === 0) return { available: false };
+            radarTileCache.clear();
+            const offsets = buildSampleGridOffsetsKm();
+            const kmPerDegLat = 111.32;
+            const kmPerDegLon = 111.32 * Math.cos(lat * Math.PI / 180);
+            const pastFrames = radarFrameMeta.filter(f => !f.isForecast).slice(-5); // ultimi ~50 min
+
+            const frameResults = [];
+            for (const frame of pastFrames) {
+                const values = [];
+                for (const off of offsets) {
+                    const sLat = lat + off.dy / kmPerDegLat;
+                    const sLon = lon + off.dx / kmPerDegLon;
+                    const tile = latLonToTileZXY(sLat, sLon, RADAR_SAMPLE_ZOOM);
+                    const imgData = await fetchTileImageData(radarHost, frame.path, tile.z, tile.x, tile.y);
+                    if (!imgData) continue;
+                    const idx = (tile.py * 256 + tile.px) * 4;
+                    const dbz = dbzFromRedChannel(imgData.data[idx]);
+                    if (dbz !== null) values.push(dbz);
+                }
+                const rawMax = values.length ? Math.max(...values) : -32;
+                // FIX 2 — Filtro errore radar: oltre 75 dBZ è quasi certamente un artefatto/errore di lettura del tile, non grandine reale
+                const radar_valid = rawMax <= 75;
+                // FIX 1 — Clamp realistico: 70 dBZ è già un nucleo estremo, valori oltre non aggiungono informazione affidabile
+                const Zmax_clamped = radar_valid && values.length ? Math.min(rawMax, 70) : -32;
+                const validValues = radar_valid ? values : [];
+                const total = offsets.length;
+                const area45 = validValues.filter(v => v >= 45).length / total;
+                const area50 = validValues.filter(v => v >= 50).length / total;
+                const area55 = validValues.filter(v => v >= 55).length / total;
+                frameResults.push({ time: frame.time, zmax: Zmax_clamped, area45, area50, area55, samples: radar_valid ? values.length : 0, discarded: !radar_valid });
+            }
+
+            const validFrames = frameResults.filter(f => f.samples > 0);
+            if (validFrames.length === 0) return { available: false };
+
+            const last = frameResults[frameResults.length - 1];
+            const prev = frameResults.length > 1 ? frameResults[frameResults.length - 2] : null;
+            const deltaZmax = prev ? (last.zmax - prev.zmax) : 0;
+
+            let persistence50 = 0;
+            for (let i = frameResults.length - 1; i >= 0; i--) {
+                if (frameResults[i].zmax >= 50) persistence50++; else break;
+            }
+
+            // --- Normalizzazioni componenti HSR_RADAR ---
+            const Zscore = (z => z < 20 ? 0 : z < 35 ? 0.2 : z < 45 ? 0.4 : z < 50 ? 0.6 : z < 55 ? 0.8 : 1.0)(last.zmax);
+            const compattezza = last.area45 > 0 ? Math.min(1, last.area55 / Math.max(last.area45, 0.05) + last.area50 * 0.5) : 0;
+            const coreConvettivo = Math.max(0, Math.min(1, last.area50 * 1.3 + compattezza * 0.3));
+            const hailSignal = (z => z >= 55 ? 1.0 : z >= 52 ? 0.7 : z >= 48 ? 0.4 : 0)(last.zmax);
+            const growth_n = Math.max(0, Math.min(1, deltaZmax / 10));
+            const persistence_n = Math.min(1, persistence50 / 3);
+            const verticalDevProxy = growth_n * 0.6 + persistence_n * 0.4;
+
+            let hsr_radar = 0.35 * Zscore + 0.25 * coreConvettivo + 0.25 * hailSignal + 0.15 * verticalDevProxy;
+            hsr_radar = Math.max(0, Math.min(1, hsr_radar));
+
+            return {
+                available: true,
+                zmax: Number(last.zmax.toFixed(1)),
+                area45: last.area45, area50: last.area50, area55: last.area55,
+                deltaZmax: Number(deltaZmax.toFixed(1)),
+                persistence50,
+                hsr_radar,
+                breakdown: { Zscore, coreConvettivo, hailSignal, growth_n, persistence_n, verticalDevProxy },
+                frameCount: validFrames.length
+            };
+        }
+
+        // ============================================================
+        // FUSIONE — HSR_FINAL
+        // ============================================================
+        const RADAR_ECHO_THRESHOLD_DBZ = 20; // sotto questa soglia: "nessuna eco significativa"
+
+        function fuseHSR(hsrModel, radarState, cape, precip, isStormActive) {
+            // FIX 4 — Il radar non può "inventare" un temporale: senza precipitazione prevista o cella attiva, il radar viene ignorato
+            if (!isStormActive || (precip !== undefined && precip < 0.5)) {
+                return { hsr_final: hsrModel, weight_radar: 0, fusion_mode: "model_only_no_precip", note: "Nessuna precipitazione/temporale attivo previsto: radar ignorato" };
+            }
+
+            // FIX 3 — Blocco fusione se l'atmosfera è sostanzialmente ferma (CAPE basso e HSR_MODEL ~0): il radar non può dominare da solo
+            if (hsrModel < 0.1 && cape < 800) {
+                return { hsr_final: hsrModel, weight_radar: 0, fusion_mode: "model_only_low_atmosphere", note: "Atmosfera inerte (CAPE basso, HSR_MODEL≈0): radar ignorato" };
+            }
+
+            if (!radarState || !radarState.available || radarState.zmax < RADAR_ECHO_THRESHOLD_DBZ) {
+                return { hsr_final: hsrModel, weight_radar: 0, fusion_mode: "model_only", note: "Nessuna eco radar significativa" };
+            }
+
+            const zmax = radarState.zmax, hsrRadar = radarState.hsr_radar;
+
+            // Peso del radar: rampa non lineare condizionata dall'intensità reale
+            let wRadar;
+            if (zmax > 55) wRadar = 0.85;
+            else if (zmax > 45) wRadar = 0.7;
+            else wRadar = 0.3 + ((zmax - RADAR_ECHO_THRESHOLD_DBZ) / (45 - RADAR_ECHO_THRESHOLD_DBZ)) * 0.4; // rampa 0.3→0.7 tra 20 e 45 dBZ
+            wRadar = Math.max(0, Math.min(0.85, wRadar));
+
+            let hsr_final = wRadar * hsrRadar + (1 - wRadar) * hsrModel;
+            let fusion_mode = zmax > 45 ? "radar_dominant" : "blended";
+
+            // Sinergia: instabilità + cella attiva entrambe alte → rischio amplificato
+            if (hsrModel > 0.6 && hsrRadar > 0.6) {
+                hsr_final = Math.min(1, hsr_final * 1.15);
+                fusion_mode += "+synergy";
+            }
+
+            // CAPE basso ma radar alto → il radar resta dominante (situazione già in atto)
+            if (cape < 300 && hsrRadar > 0.6) {
+                hsr_final = Math.max(hsr_final, hsrRadar * 0.9);
+                fusion_mode += "+radar_override_low_cape";
+            }
+
+            // Soglia minima imposta per nuclei severi
+            if (zmax > 55) {
+                hsr_final = Math.max(hsr_final, 0.8);
+                fusion_mode = "radar_severe_floor";
+            }
+
+            hsr_final = Math.max(0, Math.min(1, hsr_final));
+            return { hsr_final, weight_radar: wRadar, fusion_mode };
+        }
+
+        function classifyFinalRisk(h) {
+            if (h < 0.2) return { level: "debole", label: "Rischio debole" };
+            if (h < 0.4) return { level: "moderato", label: "Rischio moderato" };
+            if (h < 0.6) return { level: "forte_temporale", label: "Forte temporale" };
+            if (h < 0.8) return { level: "grandine_possibile", label: "Grandine possibile" };
+            return { level: "grandine_severa", label: "Grandine probabile/severa" };
+        }
+
 
         function getRainDotsHTML(rainMm) {
             if (!rainMm || rainMm <= 0) return '';
@@ -646,6 +859,26 @@
                     : `<span class="w-1.5 h-1.5 rounded-full bg-white/20 transition-all duration-300"></span>`;
             }
             return html;
+        }
+
+        // Il codice meteo (weather_code) e i mm di pioggia sono due campi indipendenti del
+        // modello: possono non coincidere (es. codice "leggera" con più mm di un'ora "moderata").
+        // Per coerenza visiva con i puntini (getRainDotsHTML), l'intensità dell'icona pioggia
+        // viene ricalcolata sui mm reali, mantenendo dal codice solo il tipo (pioggia/neve/ecc).
+        function reconcileRainIcon(icon, rainMm) {
+            if (icon !== 'rain-light' && icon !== 'rain' && icon !== 'rain-heavy') return icon;
+            const mm = rainMm || 0;
+            if (mm > 8.0) return 'rain-heavy';
+            if (mm > 3.0) return 'rain';
+            return 'rain-light';
+        }
+        // Variante per i totali giornalieri (mm/giorno), soglie diverse da quelle orarie
+        function reconcileRainIconDaily(icon, rainSumMm) {
+            if (icon !== 'rain-light' && icon !== 'rain' && icon !== 'rain-heavy') return icon;
+            const mm = rainSumMm || 0;
+            if (mm > 25.0) return 'rain-heavy';
+            if (mm > 10.0) return 'rain';
+            return 'rain-light';
         }
 
         function checkIsNight(hour) { return hour >= 21 || hour < 6; }
@@ -677,6 +910,7 @@
         }
 
         let currentWeatherData = null, leafletMap = null, radarTileLayers = [], radarFrameTimes = [], currentRadarIndex = 0, radarInterval = null, userMarker = null, isRadarPlaying = true;
+        let radarHost = '', radarFrameMeta = [], currentRadarState = null;
         let currentLat = 45.4642, currentLon = 9.1900, currentCityName = "Milano", lastFetchTimestamp = 0;
 
         function initOrUpdateRadar(lat, lon) {
@@ -711,8 +945,11 @@
                 const allFrames = [];
 
                 pastFrames.slice(-8).forEach(f => allFrames.push({ time: f.time, path: f.path, isForecast: false }));
-                forecastFrames.slice(0, 3).forEach(f => allFrames.push({ time: f.time, path: f.path, isForecast: true }));
+                forecastFrames.forEach(f => allFrames.push({ time: f.time, path: f.path, isForecast: true })); // tutti i frame di previsione forniti da RainViewer (tipicamente fino a +30/+40 min)
                 if (allFrames.length === 0) return;
+
+                radarHost = host;
+                radarFrameMeta = allFrames;
 
                 const nowSec = Math.floor(Date.now() / 1000);
                 allFrames.forEach((frame) => {
@@ -729,6 +966,14 @@
                 currentRadarIndex = Math.max(0, pastFrames.slice(-8).length - 1);
                 showRadarFrame(currentRadarIndex);
                 startRadarAnimation();
+
+                // Modulo radar (HSR_RADAR): analizza il campo reale attorno al punto e rifonde l'alert
+                try {
+                    analyzeRadarField(currentLat, currentLon).then(state => {
+                        currentRadarState = state;
+                        if (currentWeatherData) checkHailAlertAlgorithm(currentWeatherData);
+                    }).catch(err => console.error('Errore analisi radar:', err));
+                } catch (err) { console.error('Errore avvio analisi radar:', err); }
             } catch (err) { console.error('Error fetching radar data:', err); }
         }
 
@@ -964,10 +1209,12 @@
 
             const weatherInfo = WEATHER_CODES[current.weather_code] || { label: 'Sereno', icon: 'sun' };
             const isNightMain = checkIsNight(now.getHours());
-            
+            const currentHourIndex = now.getHours();
+            const nowRainMm = data.hourly.precipitation ? (data.hourly.precipitation[currentHourIndex] || 0) : 0;
+
             const weatherDescEl = document.getElementById('weatherDesc');
             if (weatherDescEl) weatherDescEl.innerText = weatherInfo.label;
-            document.getElementById('mainWeatherIcon').innerHTML = getSVGIcon(weatherInfo.icon, "w-20 h-20 sm:w-24 sm:h-24", isNightMain);
+            document.getElementById('mainWeatherIcon').innerHTML = getSVGIcon(reconcileRainIcon(weatherInfo.icon, nowRainMm), "w-20 h-20 sm:w-24 sm:h-24", isNightMain);
             document.getElementById('mainTemp').innerText = Math.round(current.temperature_2m);
             document.getElementById('feelsLike').innerText = `Percepita: ${Math.round(current.apparent_temperature)}°C`;
 
@@ -984,9 +1231,8 @@
             document.getElementById('humidity').innerText = `${current.relative_humidity_2m}%`;
             document.getElementById('pressure').innerText = `${Math.round(current.surface_pressure)} hPa`;
             
-            const currentHourIndex = now.getHours();
             const rainProb = data.hourly.precipitation_probability ? (data.hourly.precipitation_probability[currentHourIndex] || 0) : 0;
-            const rainMm = data.hourly.precipitation ? (data.hourly.precipitation[currentHourIndex] || 0) : 0;
+            const rainMm = nowRainMm;
 
             const mainRainBox = document.getElementById('mainRainBox');
             if (rainMm > 0 || rainProb > 0) {
@@ -1000,11 +1246,13 @@
             }
             mainRainBox.classList.remove('hidden');
 
-            renderTodayHourly(data); renderDailyForecast(data); checkHailAlertAlgorithm(data);
+            renderTodayHourly(data); renderDailyForecast(data);
+            try { checkHailAlertAlgorithm(data); } catch (hailErr) { console.error('Errore modulo grandine (non blocca il resto della previsione):', hailErr); }
         }
 
         let lastEvaluatedHailResult = null;
         let lastEvaluatedRareEvent = null;
+        let lastNowFusion = null;
         function checkHailAlertAlgorithm(data) {
             const alertCard = document.getElementById('hailAlertCard'), alertText = document.getElementById('hailAlertText');
             const rareCard = document.getElementById('rareHailAlertCard'), rareText = document.getElementById('rareHailAlertText');
@@ -1013,6 +1261,7 @@
             const cutoff = Math.min(currentHourIndex + 48, data.hourly.time.length);
             let maxProb = 0; let peakObj = null;
             let peakRareObj = null;
+            let nowModelResult = null, nowCape = 0, nowPrecip = 0;
 
             for (let i = currentHourIndex; i < cutoff; i++) {
                 const cape = data.hourly.cape ? (data.hourly.cape[i] || 0) : 0;
@@ -1039,6 +1288,7 @@
                 }
 
                 const hailRes = calculateHailIndex({ cape, cin, u850, v850, u500, v500, t700, t500, z700, z500, freezing_level: freezing, precip, fallback_shear });
+                if (i === currentHourIndex) { nowModelResult = hailRes; nowCape = cape; nowPrecip = precip; }
                 if (hailRes.hsr_final > maxProb) { maxProb = hailRes.hsr_final; peakObj = { index: i, date: new Date(data.hourly.time[i]), cape, cin, precip, result: hailRes }; }
 
                 if (hailRes.rare_event && hailRes.rare_event.flag) {
@@ -1051,14 +1301,39 @@
             lastEvaluatedHailResult = peakObj;
             lastEvaluatedRareEvent = peakRareObj;
 
-            // Alert Rischio Grandine Standard (HSR)
-            if (maxProb >= 0.35 && peakObj) {
-                const timeStr = peakObj.date.toLocaleDateString('it-IT', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
-                alertText.innerHTML = `<p class="font-semibold text-amber-100">Picco stimato: <span class="text-white">${timeStr}</span> (HSR: <span class="text-white font-bold">${Math.round(maxProb * 100)}%</span>)</p>
-                                       <p class="text-amber-200/90 font-medium">${peakObj.result.label} - Chicchi stimati: ~${peakObj.result.estSize} cm</p>`;
-                alertCard.querySelector('.font-bold span').innerText = maxProb >= 0.75 ? "🚨 ALTO RISCHIO GRANDINE!" : "⚠️ ALLERTA RISCHIO GRANDINE";
-                alertCard.classList.remove('hidden');
-            } else { alertCard.classList.add('hidden'); }
+            try {
+                // Fusione ibrida HSR_FINAL per l'istante attuale (modello + radar reale)
+                const nowFusion = nowModelResult ? fuseHSR(nowModelResult.hsr_final, currentRadarState, nowCape, nowPrecip, nowModelResult.isStormActive) : { hsr_final: 0, weight_radar: 0, fusion_mode: "n/d" };
+                const nowClass = classifyFinalRisk(nowFusion.hsr_final);
+                lastNowFusion = { fusion: nowFusion, modelResult: nowModelResult, radarState: currentRadarState, cape: nowCape, classification: nowClass };
+
+                // Alert Rischio Grandine Standard (HSR) — privilegia il dato "adesso" fuso col radar se supera il picco previsto
+                const showNow = nowModelResult && nowFusion.hsr_final >= maxProb;
+                const displayVal = showNow ? nowFusion.hsr_final : maxProb;
+                if (displayVal >= 0.35 && (showNow || peakObj)) {
+                    if (showNow) {
+                        alertText.innerHTML = `<p class="font-semibold text-amber-100">Adesso (radar+modello): <span class="text-white font-bold">${Math.round(nowFusion.hsr_final * 100)}%</span> — ${nowClass.label}</p>
+                                               <p class="text-amber-200/90 font-medium">${currentRadarState && currentRadarState.available ? `Zmax radar: ${currentRadarState.zmax} dBZ` : 'Nessuna eco radar significativa, stima da soli dati atmosferici'}</p>`;
+                    } else {
+                        const timeStr = peakObj.date.toLocaleDateString('it-IT', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+                        alertText.innerHTML = `<p class="font-semibold text-amber-100">Picco stimato: <span class="text-white">${timeStr}</span> (HSR: <span class="text-white font-bold">${Math.round(maxProb * 100)}%</span>)</p>
+                                               <p class="text-amber-200/90 font-medium">${peakObj.result.label} - Chicchi stimati: ~${peakObj.result.estSize} cm</p>`;
+                    }
+                    alertCard.querySelector('.font-bold span').innerText = displayVal >= 0.75 ? "🚨 ALTO RISCHIO GRANDINE!" : "⚠️ ALLERTA RISCHIO GRANDINE";
+                    alertCard.classList.remove('hidden');
+                } else { alertCard.classList.add('hidden'); }
+            } catch (fusionErr) {
+                console.error('Errore nella fusione HSR_FINAL, uso solo il modello atmosferico:', fusionErr);
+                lastNowFusion = null;
+                // Fallback: comportamento identico alla versione solo-atmosferica
+                if (maxProb >= 0.35 && peakObj) {
+                    const timeStr = peakObj.date.toLocaleDateString('it-IT', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+                    alertText.innerHTML = `<p class="font-semibold text-amber-100">Picco stimato: <span class="text-white">${timeStr}</span> (HSR: <span class="text-white font-bold">${Math.round(maxProb * 100)}%</span>)</p>
+                                           <p class="text-amber-200/90 font-medium">${peakObj.result.label} - Chicchi stimati: ~${peakObj.result.estSize} cm</p>`;
+                    alertCard.querySelector('.font-bold span').innerText = maxProb >= 0.75 ? "🚨 ALTO RISCHIO GRANDINE!" : "⚠️ ALLERTA RISCHIO GRANDINE";
+                    alertCard.classList.remove('hidden');
+                } else { alertCard.classList.add('hidden'); }
+            }
 
             // Alert Separato Evento Raro (>4 cm)
             if (rareCard && rareText) {
@@ -1080,13 +1355,52 @@
         function toggleHailDebugModal() {
             const modal = document.getElementById('hailDebugModal');
             if (modal.classList.contains('hidden')) {
-                const targetObj = lastEvaluatedRareEvent || lastEvaluatedHailResult;
-                if (targetObj) {
-                    const r = targetObj, res = r.result, brk = res.breakdown;
-                    const rare = res.rare_event || { flag: false, level: "none", index: 0, potential_size: null };
-                    document.getElementById('hailDebugContent').innerHTML = `
+                try {
+                    const nf = lastNowFusion;
+                    const nmBrk = nf && nf.modelResult ? nf.modelResult.breakdown : null;
+                    const nowSectionHtml = nf ? `
+                        <div class="bg-white/5 p-3 rounded-xl border border-white/10 space-y-2 mb-3">
+                            <p class="font-bold text-sky-300 text-sm">HSR Ibrido (Nowcasting) — Adesso:</p>
+                            <p><b>HSR_FINAL:</b> <span class="text-white font-bold text-base">${Math.round(nf.fusion.hsr_final * 100)}%</span> (${nf.classification.label})</p>
+                            <p><b>Modalità fusione:</b> <span class="text-xs">${nf.fusion.fusion_mode}</span> — peso radar: ${Math.round(nf.fusion.weight_radar * 100)}%</p>
+                            <hr class="border-white/10 my-1">
+                            <p class="font-semibold text-sky-200">HSR_MODEL (atmosferico) — dati grezzi:</p>
+                            <ul class="list-disc pl-4 space-y-1 text-slate-200 text-xs">
+                                <li><b>Valore modulo:</b> ${nf.modelResult ? Math.round(nf.modelResult.hsr_final * 100) + '%' : 'n/d'}</li>
+                                <li><b>CAPE:</b> ${Math.round(nf.cape)} J/kg ${nmBrk ? `(score: ${nmBrk.cape_n.toFixed(2)})` : ''}</li>
+                                ${nmBrk ? `
+                                <li><b>Wind shear 0-6km:</b> ${nmBrk.shear_0_6km} m/s (score: ${nmBrk.shear_n.toFixed(2)})</li>
+                                <li><b>Quota zero termico:</b> ${nmBrk.frz_level} m (score: ${nmBrk.frz_n.toFixed(2)})</li>
+                                <li><b>Lapse rate:</b> ${nmBrk.lapse_rate} °C/km (score: ${nmBrk.lr_n.toFixed(2)})</li>
+                                <li><b>CIN:</b> moltiplicatore ${nmBrk.cin_n.toFixed(2)}</li>
+                                <li><b>Precipitazione oraria:</b> ${nf.modelResult.storm_state ? `stato ${nmBrk.storm_state}` : ''} (fattore x${nmBrk.storm_factor.toFixed(2)}, struttura x${nmBrk.structure_factor.toFixed(2)})</li>` : ''}
+                            </ul>
+                            <p class="font-semibold text-sky-200 mt-2">HSR_RADAR — dati grezzi:</p>
+                            <ul class="list-disc pl-4 space-y-1 text-slate-200 text-xs">
+                                ${nf.radarState && nf.radarState.available ? `
+                                <li><b>Valore modulo:</b> ${Math.round(nf.radarState.hsr_radar * 100)}%</li>
+                                <li><b>Zmax:</b> ${nf.radarState.zmax} dBZ (score: ${nf.radarState.breakdown.Zscore.toFixed(2)})</li>
+                                <li><b>ΔZmax (10-15 min):</b> ${nf.radarState.deltaZmax >= 0 ? '+' : ''}${nf.radarState.deltaZmax} dBZ (crescita score: ${nf.radarState.breakdown.growth_n.toFixed(2)})</li>
+                                <li><b>Area &gt;45 / &gt;50 / &gt;55 dBZ:</b> ${Math.round(nf.radarState.area45*100)}% / ${Math.round(nf.radarState.area50*100)}% / ${Math.round(nf.radarState.area55*100)}%</li>
+                                <li><b>Core convettivo (compattezza):</b> score ${nf.radarState.breakdown.coreConvettivo.toFixed(2)}</li>
+                                <li><b>Segnale grandine (dBZ&gt;52-55):</b> score ${nf.radarState.breakdown.hailSignal.toFixed(2)}</li>
+                                <li><b>Persistenza nucleo &gt;50 dBZ:</b> ${nf.radarState.persistence50} frame (score: ${nf.radarState.breakdown.persistence_n.toFixed(2)})</li>
+                                <li><b>Frame radar validi analizzati:</b> ${nf.radarState.frameCount}</li>` : `<li>Nessuna eco radar significativa nell'area (sotto ${RADAR_ECHO_THRESHOLD_DBZ} dBZ o dati non disponibili)</li>`}
+                            </ul>
+                        </div>` : `
+                        <div class="bg-white/5 p-3 rounded-xl border border-white/10 space-y-1 mb-3">
+                            <p class="font-bold text-sky-300 text-sm">HSR Ibrido (Nowcasting) — Adesso:</p>
+                            <p class="text-slate-300 text-xs">Analisi radar/modello per l'istante attuale non ancora disponibile (in caricamento o dati insufficienti).</p>
+                        </div>`;
+
+                    const targetObj = lastEvaluatedRareEvent || lastEvaluatedHailResult;
+                    let peakSectionHtml;
+                    if (targetObj) {
+                        const r = targetObj, res = r.result, brk = res.breakdown;
+                        const rare = res.rare_event || { flag: false, level: "none", index: 0, potential_size: null };
+                        peakSectionHtml = `
                         <div class="bg-white/5 p-3 rounded-xl border border-white/10 space-y-2">
-                            <p class="font-bold text-amber-300 text-sm">Dettagli HSR (Hail Size Risk v3) per il picco:</p>
+                            <p class="font-bold text-amber-300 text-sm">Dettagli HSR_MODEL (atmosferico) per il picco previsto:</p>
                             <p><b>Data/Ora:</b> ${r.date.toLocaleString('it-IT')}</p>
                             <p><b>HSR Finale:</b> <span class="text-white font-bold text-base">${Math.round(res.hsr_final * 100)}%</span> (${res.label})</p>
                             <p><b>Diametro Stimato:</b> <span class="text-white font-bold">~${res.estSize} cm</span></p>
@@ -1113,7 +1427,15 @@
                                 <li><b>Stima Grandine Estrema:</b> ${rare.potential_size ? `<span class="text-amber-300 font-bold">~${rare.potential_size} cm</span>` : '<span class="text-slate-400">Nessuna (>4 cm non previsto)</span>'}</li>
                             </ul>
                         </div>`;
-                } else { document.getElementById('hailDebugContent').innerHTML = `<p class="text-slate-300">Nessun dato di instabilità rilevato per le prossime 48 ore.</p>`; }
+                    } else {
+                        peakSectionHtml = `<div class="bg-white/5 p-3 rounded-xl border border-white/10"><p class="text-slate-300 text-xs">Nessun picco di instabilità atmosferica rilevato nelle prossime 48 ore (il modello previsionale non stima pioggia/temporali significativi).</p></div>`;
+                    }
+
+                    document.getElementById('hailDebugContent').innerHTML = nowSectionHtml + peakSectionHtml;
+                } catch (debugErr) {
+                    console.error('Errore nel pannello parametri grandine:', debugErr);
+                    document.getElementById('hailDebugContent').innerHTML = `<p class="text-slate-300">Impossibile mostrare i dettagli in questo momento.</p>`;
+                }
                 modal.classList.remove('hidden');
             } else { modal.classList.add('hidden'); }
         }
@@ -1136,7 +1458,7 @@
                 div.className = 'flex-shrink-0 w-22 bg-white/5 hover:bg-white/10 rounded-xl p-2 text-center transition border border-white/10 flex flex-col items-center justify-between gap-1';
                 div.innerHTML = `
                     <span class="text-[11px] font-medium text-white/80">${i === currentHour ? 'Ora' : hourFormatted}</span>
-                    <div class="my-0.5 flex items-center justify-center">${getSVGIcon(wInfo.icon, "w-7 h-7", checkIsNight(dateObj.getHours()))}</div>
+                    <div class="my-0.5 flex items-center justify-center">${getSVGIcon(reconcileRainIcon(wInfo.icon, rainMm), "w-7 h-7", checkIsNight(dateObj.getHours()))}</div>
                     <div class="flex flex-col items-center gap-0.5 my-0.5">
                         <span class="text-base font-bold text-white">${temp}°C</span>
                         <div class="flex items-center justify-center gap-1 text-[10px] ${windSpeed >= 40 ? 'text-red-400 font-bold' : 'text-sky-200'}">
@@ -1169,7 +1491,7 @@
 
                 row.innerHTML = `
                     <div class="w-24 sm:w-28 font-bold text-base sm:text-lg capitalize truncate">${dayName}</div>
-                    <div class="flex items-center justify-center w-12 sm:w-16">${getSVGIcon(wInfo.icon, "w-10 h-10 sm:w-12 sm:h-12")}</div>
+                    <div class="flex items-center justify-center w-12 sm:w-16">${getSVGIcon(reconcileRainIconDaily(wInfo.icon, rainSum), "w-10 h-10 sm:w-12 sm:h-12")}</div>
                     <div class="flex flex-col items-center justify-center text-center w-24">
                         ${(rainSum > 0 || rainProbMax > 0) ? `<span class="text-[10px] font-medium text-sky-200/80 leading-tight">${rainProbMax}%</span><span class="text-[11px] font-bold text-sky-100 leading-tight">${rainSum.toFixed(1)} mm</span><div class="flex items-center justify-center gap-1 mt-0.5">${getRainDotsHTML(rainSum)}</div>` : ``}
                     </div>
@@ -1325,7 +1647,7 @@
                 item.className = 'flex items-center justify-between p-3 sm:p-3.5 bg-white/5 hover:bg-white/15 rounded-xl transition border border-white/10 text-base gap-2';
                 item.innerHTML = `
                     <div class="w-16 sm:w-20 font-bold text-sky-200 text-base sm:text-lg shrink-0">${hourTime.getHours().toString().padStart(2, '0')}:00</div>
-                    <div class="flex items-center justify-center w-12 sm:w-16">${getSVGIcon(wInfo.icon, "w-9 h-9 sm:w-10 sm:h-10", checkIsNight(hourTime.getHours()))}</div>
+                    <div class="flex items-center justify-center w-12 sm:w-16">${getSVGIcon(reconcileRainIcon(wInfo.icon, rainMm), "w-9 h-9 sm:w-10 sm:h-10", checkIsNight(hourTime.getHours()))}</div>
                     <div class="flex flex-col items-center justify-center text-center w-28">
                         ${(rainMm > 0 || rainProb > 0) ? `<span class="text-xs sm:text-sm font-semibold text-sky-200/90 leading-tight">${rainProb}%</span><span class="text-sm sm:text-base font-extrabold text-sky-100 leading-tight">${rainMm.toFixed(1)} mm</span><div class="flex items-center justify-center gap-1 mt-0.5">${getRainDotsHTML(rainMm)}</div>` : ``}
                     </div>
