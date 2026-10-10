@@ -82,6 +82,9 @@
             border: 1px solid rgba(255, 255, 255, 0.1);
         }
 
+        select { color-scheme: dark; }
+        select option { background-color: #0f172a; color: #f1f5f9; }
+
         #radarMapContainer {
             touch-action: pan-x pan-y;
         }
@@ -188,7 +191,7 @@
             </div>
 
             <!-- Secondary Metrics Grid -->
-            <div class="grid grid-cols-3 gap-1.5 text-center mt-3 pt-2 border-t border-white/15">
+            <div class="grid grid-cols-4 gap-1.5 text-center mt-3 pt-2 border-t border-white/15">
                 <div class="p-1.5 bg-white/5 rounded-xl flex flex-col items-center justify-center text-center">
                     <p class="text-[10px] text-white/70 uppercase font-medium">Umidità</p>
                     <p id="humidity" class="text-sm font-bold text-sky-100">--%</p>
@@ -206,6 +209,11 @@
                 <div class="p-1.5 bg-white/5 rounded-xl flex flex-col items-center justify-center text-center">
                     <p class="text-[10px] text-white/70 uppercase font-medium">Pressione</p>
                     <p id="pressure" class="text-sm font-bold text-sky-100">-- hPa</p>
+                </div>
+
+                <div class="p-1.5 bg-white/5 rounded-xl flex flex-col items-center justify-center text-center">
+                    <p class="text-[10px] text-white/70 uppercase font-medium leading-tight">Grandine<br>&gt;3 cm</p>
+                    <p id="hailRisk3cm" class="text-sm font-bold text-sky-100">--%</p>
                 </div>
             </div>
         </main>
@@ -312,6 +320,40 @@
             </div>
         </section>
 
+        <!-- Mappa Modello ECMWF (ricostruita da dati Open-Meteo, stile Meteociel) -->
+        <section class="glass-panel rounded-2xl p-3 shadow-lg">
+            <div class="flex items-center justify-between mb-2 gap-2">
+                <h2 class="text-xs font-semibold text-sky-200 uppercase tracking-wider flex items-center gap-1.5 shrink-0">
+                    <svg class="w-4 h-4 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                    </svg>
+                    Mappa ECMWF
+                </h2>
+                <select id="ecmwfParamSelect" class="text-[11px] bg-white/10 border border-white/20 rounded-lg px-1.5 py-1 text-sky-100 shrink-0">
+                    <option value="precip" selected>Precipitazione 3h</option>
+                    <option value="geop500">Geopotenziale 500 hPa</option>
+                </select>
+            </div>
+
+            <div id="ecmwfMapWrap" class="relative w-full h-96 sm:h-[30rem] rounded-xl overflow-hidden border border-white/10 shadow-inner bg-slate-900/60">
+                <div id="ecmwfMapContainer" class="w-full h-full"></div>
+                <div class="absolute top-2 left-2 z-[1000] bg-slate-900/80 backdrop-blur-md px-2 py-1 rounded-lg border border-white/20 text-white text-[10px] font-semibold pointer-events-none" id="ecmwfTimeLabel">--</div>
+                <div id="ecmwfLoadingOverlay" class="absolute inset-0 z-[1100] bg-slate-900/70 backdrop-blur-sm flex items-center justify-center text-sky-200 text-xs font-medium">
+                    Caricamento dati ECMWF...
+                </div>
+            </div>
+
+            <div class="mt-2.5 pt-2 border-t border-white/10 flex flex-col gap-1.5">
+                <input id="ecmwfSlider" type="range" min="0" max="1" value="0" step="1" class="w-full accent-sky-400">
+                <div class="flex items-center justify-between text-[10px] text-slate-400">
+                    <span>Adesso</span>
+                    <span>+7gg</span>
+                </div>
+                <div id="ecmwfLegend" class="pt-1"></div>
+                <p id="ecmwfHRStatus" class="text-[10px] text-sky-300 min-h-[1rem]"></p>
+                <p class="text-[10px] text-slate-400">Dati ECMWF IFS 0.25° via Open-Meteo (open-data, CC-BY 4.0)</p>
+            </div>
+        </section>
 
     </div>
 
@@ -482,6 +524,7 @@
     </div>
 
     <script>
+        // disable-loop-protection
         const WEATHER_CODES = {
             0: { label: 'Sereno', icon: 'sun' },
             1: { label: 'Prevalentemente Sereno', icon: 'sun-cloud' },
@@ -833,6 +876,20 @@
             return { hsr_final, weight_radar: wRadar, fusion_mode };
         }
 
+        // Percentuale di rischio grandine >3 cm, derivata dall'algoritmo HSR esistente:
+        // usa la soglia "large" (hsr_final >= 0.75, tier "Rischio grandine >3 cm") come base
+        // 0-70%, e la affina con l'indice di evento raro (0-8, favorevole a chicchi grandi:
+        // CAPE alto, shear forte, zero termico basso) per un boost fino a +30%.
+        function hailRiskOver3cmPercent(hsrFinal, rareEvent) {
+            if (hsrFinal === undefined || hsrFinal === null) return 0;
+            let base = 0;
+            if (hsrFinal >= 0.75) base = ((hsrFinal - 0.75) / 0.25) * 70;
+            else if (hsrFinal >= 0.55) base = ((hsrFinal - 0.55) / 0.20) * 15;
+            // il boost vale solo se l'HSR indica già grandine (>= 0.4): senza, le condizioni favorevoli da sole non bastano
+            const rareBoost = (rareEvent && rareEvent.index && hsrFinal >= 0.4) ? (rareEvent.index / 8) * 30 : 0;
+            return Math.max(0, Math.min(100, Math.round(base + rareBoost)));
+        }
+
         function classifyFinalRisk(h) {
             if (h < 0.2) return { level: "debole", label: "Rischio debole" };
             if (h < 0.4) return { level: "moderato", label: "Rischio moderato" };
@@ -882,6 +939,625 @@
         }
 
         function checkIsNight(hour) { return hour >= 21 || hour < 6; }
+
+        // ============================================================================
+        // MAPPA MODELLO ECMWF — ricostruzione via Open-Meteo (dati open-data IFS 0.25°,
+        // CC-BY 4.0), campionando una griglia di punti sull'Europa invece di incorporare
+        // le mappe proprietarie di Meteociel (il cui utilizzo richiede autorizzazione).
+        // ============================================================================
+        const ECMWF_PARAMS = {
+            geop500: { variable: 'geopotential_height_500hPa', label: 'Geopotenziale 500 hPa', unit: 'm', contourStep: 40, labelDiv: 10,
+                       note: 'Isoipse ogni 4 dam (etichette in decametri)', ticks: [5000, 5200, 5400, 5600, 5800],
+                       stops: [[5000,[60,40,150,255]], [5200,[60,100,210,255]], [5360,[90,170,240,255]], [5460,[190,230,250,255]], [5540,[250,250,190,255]], [5620,[255,210,110,255]], [5700,[250,150,60,255]], [5800,[225,70,40,255]], [5900,[150,25,40,255]]] },
+            precip:  { variable: 'precipitation', label: 'Precipitazione 3h', unit: 'mm/3h', contourLevels: [0.5, 1, 2, 5, 10, 20, 40], labelDiv: 1, lutPow: 0.5,
+                       note: 'Somma delle 3 ore precedenti; isolinee a 0,5 · 1 · 2 · 5 · 10 · 20 · 40 mm', ticks: [0.5, 1, 2, 5, 10, 25, 60],
+                       stops: [[0.1,[255,255,255,0]], [0.1,[190,225,255,140]], [0.5,[140,195,255,175]], [1,[90,160,250,200]], [2,[50,120,235,215]], [4,[30,170,110,225]], [7,[110,200,50,235]], [10,[250,230,40,240]], [15,[250,170,30,245]], [25,[245,90,30,250]], [40,[220,30,50,255]], [60,[180,20,140,255]], [100,[110,20,170,255]]] }
+        };
+        // Tabella colori precalcolata (LUT). Per le precipitazioni l'indice è non lineare (radice quadrata):
+        // così i valori bassi (0,1-5 mm), i più frequenti, hanno molte più sfumature di colore.
+        const ECMWF_LUT_N = 2048;
+        Object.values(ECMWF_PARAMS).forEach(p => {
+            p.vmin = p.stops[0][0]; p.vmax = p.stops[p.stops.length - 1][0];
+            p.lut = new Uint8ClampedArray(ECMWF_LUT_N * 4);
+            for (let i = 0; i < ECMWF_LUT_N; i++) {
+                let norm = i / (ECMWF_LUT_N - 1);
+                if (p.lutPow) norm = Math.pow(norm, 1 / p.lutPow);
+                const c = interpolateStops(p.vmin + norm * (p.vmax - p.vmin), p.stops);
+                p.lut[i * 4] = c[0]; p.lut[i * 4 + 1] = c[1]; p.lut[i * 4 + 2] = c[2]; p.lut[i * 4 + 3] = c[3];
+            }
+            p.color = v => interpolateStops(v, p.stops);
+        });
+
+        function interpolateStops(value, stops) {
+            if (value === null || value === undefined || Number.isNaN(value)) return [0, 0, 0, 0];
+            if (value <= stops[0][0]) return stops[0][1];
+            if (value >= stops[stops.length - 1][0]) return stops[stops.length - 1][1];
+            for (let i = 0; i < stops.length - 1; i++) {
+                const [t0, c0] = stops[i], [t1, c1] = stops[i + 1];
+                if (value >= t0 && value <= t1) {
+                    const f = t1 === t0 ? 0 : (value - t0) / (t1 - t0);
+                    return [c0[0] + (c1[0] - c0[0]) * f, c0[1] + (c1[1] - c0[1]) * f, c0[2] + (c1[2] - c0[2]) * f, c0[3] + (c1[3] - c0[3]) * f];
+                }
+            }
+            return stops[stops.length - 1][1];
+        }
+
+        // Griglia Europa (1.5° di passo, ~510 punti): il piano gratuito Open-Meteo concede 600 chiamate/min
+        // e ogni località conta come una chiamata, quindi si scarica UNA volta sola con tutti i parametri
+        // insieme (+ cache locale di 3 ore) e si infittisce con interpolazione bicubica lato client.
+        const ECMWF_LAT_MIN = 32, ECMWF_LAT_MAX = 66, ECMWF_LAT_STEP = 2;
+        const ECMWF_LON_MIN = -20, ECMWF_LON_MAX = 36, ECMWF_LON_STEP = 2;
+        const ECMWF_UPSAMPLE = 3; // fattore di infittimento bicubico (1.5° -> 0.5°)
+        const ecmwfGridLats = []; for (let la = ECMWF_LAT_MAX; la >= ECMWF_LAT_MIN; la -= ECMWF_LAT_STEP) ecmwfGridLats.push(Number(la.toFixed(2))); // nord->sud
+        const ecmwfGridLons = []; for (let lo = ECMWF_LON_MIN; lo <= ECMWF_LON_MAX; lo += ECMWF_LON_STEP) ecmwfGridLons.push(Number(lo.toFixed(2))); // ovest->est
+        const ECMWF_BOUNDS = [[ECMWF_LAT_MIN, ECMWF_LON_MIN], [ECMWF_LAT_MAX, ECMWF_LON_MAX]];
+        const ECMWF_GRID_SIG = [ECMWF_LAT_MIN, ECMWF_LAT_MAX, ECMWF_LAT_STEP, ECMWF_LON_MIN, ECMWF_LON_MAX, ECMWF_LON_STEP].join('_');
+        const ECMWF_CACHE_KEY = 'ecmwf_fields_v8';
+        const ECMWF_CACHE_TTL_MS = 3 * 3600 * 1000;
+
+        let ecmwfFieldCache = {}; // chiave parametro -> { times, grids }
+        let ecmwfCurrentParam = 'precip';
+        let ecmwfTimelineIndex = 0, ecmwfStartedNow = false;
+        let ecmwfLeafletMap = null, ecmwfImageOverlay = null;
+        let ecmwfLoadPromise = null;
+
+        const ECMWF_ENDPOINTS = ['https://api.open-meteo.com/v1/forecast', 'https://api.open-meteo.com/v1/ecmwf'];
+        let ecmwfEndpoint = null;
+
+        function ecmwfUrl(base, lats, lons, days, varList) {
+            const vars = (varList || Object.values(ECMWF_PARAMS).map(p => p.variable)).join(',');
+            return `${base}?latitude=${lats.join(',')}&longitude=${lons.join(',')}&hourly=${vars}&models=ecmwf_ifs025&forecast_days=${days}&cell_selection=nearest&elevation=${lats.map(() => 'nan').join(',')}&timezone=UTC`;
+        }
+
+        async function ecmwfRequest(url) {
+            const res = await fetch(url);
+            if (!res.ok) {
+                let reason = '';
+                try { const j = await res.json(); reason = j.reason || ''; } catch (e) { /* corpo non JSON */ }
+                const err = new Error(`${reason || 'errore'} (HTTP ${res.status})`);
+                err.status = res.status;
+                throw err;
+            }
+            const j = await res.json();
+            return Array.isArray(j) ? j : [j];
+        }
+
+        // Richiesta di prova (1 sola località, 1 giorno): trova l'endpoint che risponde con tutte le variabili
+        // prima di lanciare il caricamento completo, e dà un errore preciso se qualcosa non va.
+        async function pickEcmwfEndpoint() {
+            if (ecmwfEndpoint) return ecmwfEndpoint;
+            const vars = Object.values(ECMWF_PARAMS).map(p => p.variable);
+            let lastErr = null;
+            for (const base of ECMWF_ENDPOINTS) {
+                try {
+                    const r = await ecmwfRequest(ecmwfUrl(base, [45], [9], 1));
+                    if (r[0] && r[0].hourly && vars.every(v => Array.isArray(r[0].hourly[v]))) { ecmwfEndpoint = base; return base; }
+                    lastErr = new Error('Risposta senza tutte le variabili richieste');
+                } catch (e) {
+                    lastErr = e;
+                    if (e.status === 429) throw e; // limite raggiunto: inutile provare l'altro endpoint
+                }
+            }
+            throw lastErr || new Error('Nessun endpoint ECMWF raggiungibile');
+        }
+
+        // Precipitazione: Open-Meteo fornisce la somma dell'ora precedente; qui si sommano le 3 ore precedenti
+        // (più leggibile delle singole ore e coerente con i passi a 3h della mappa).
+        function ecmwfValueAt(key, arr, t) {
+            if (!arr) return null;
+            if (key !== 'precip') return arr[t];
+            let sum = 0, n = 0;
+            for (let k = Math.max(0, t - 2); k <= t; k++) { const v = arr[k]; if (v !== null && v !== undefined) { sum += v; n++; } }
+            return n ? sum : null;
+        }
+
+        async function fetchEcmwfAll() {
+            const base = await pickEcmwfEndpoint();
+            const points = [];
+            ecmwfGridLats.forEach(lat => ecmwfGridLons.forEach(lon => points.push({ lat, lon })));
+            const chunkSize = 100;
+            const flat = [];
+            for (let i = 0; i < points.length; i += chunkSize) { // in sequenza: niente raffica di richieste parallele
+                const ch = points.slice(i, i + chunkSize);
+                const part = await ecmwfRequest(ecmwfUrl(base, ch.map(p => p.lat), ch.map(p => p.lon), 7));
+                flat.push(...part);
+            }
+            if (flat.length !== points.length || !flat[0].hourly) throw new Error('Risposta ECMWF incompleta');
+
+            const allTimes = flat[0].hourly.time;
+            const nRows = ecmwfGridLats.length, nCols = ecmwfGridLons.length;
+            const stepIndices = [];
+            for (let t = 0; t < allTimes.length; t += 3) stepIndices.push(t); // passo 3h, come Meteociel
+            const times = stepIndices.map(t => allTimes[t]);
+
+            const fields = {};
+            Object.entries(ECMWF_PARAMS).forEach(([key, p]) => {
+                const grids = stepIndices.map(t => {
+                    const grid = [];
+                    for (let r = 0; r < nRows; r++) {
+                        const row = [];
+                        for (let c = 0; c < nCols; c++) {
+                            const arr = flat[r * nCols + c].hourly[p.variable];
+                            const v = ecmwfValueAt(key, arr, t);
+                            row.push(v === null || v === undefined ? NaN : v);
+                        }
+                        grid.push(row);
+                    }
+                    return grid;
+                });
+                fields[key] = { times, grids };
+            });
+            ecmwfLastBulkEnd = Date.now();
+            return fields;
+        }
+
+        function loadEcmwfFromStorage() {
+            try {
+                const raw = localStorage.getItem(ECMWF_CACHE_KEY);
+                if (!raw) return null;
+                const o = JSON.parse(raw);
+                if (!o || o.sig !== ECMWF_GRID_SIG || (Date.now() - o.ts) > ECMWF_CACHE_TTL_MS) return null;
+                const fields = {};
+                Object.keys(o.fields).forEach(k => {
+                    fields[k] = { times: o.fields[k].times, grids: o.fields[k].grids.map(g => g.map(row => row.map(v => v === null ? NaN : v))) };
+                });
+                return fields;
+            } catch (e) { return null; }
+        }
+
+        function saveEcmwfToStorage(fields) {
+            try {
+                const out = {};
+                Object.keys(fields).forEach(k => {
+                    out[k] = { times: fields[k].times, grids: fields[k].grids.map(g => g.map(row => row.map(v => Number.isNaN(v) ? null : Math.round(v * 10) / 10))) };
+                });
+                localStorage.setItem(ECMWF_CACHE_KEY, JSON.stringify({ ts: Date.now(), sig: ECMWF_GRID_SIG, fields: out }));
+            } catch (e) { /* quota piena o storage non disponibile: si continua senza cache */ }
+        }
+
+        function ensureEcmwfData() {
+            if (Object.keys(ecmwfFieldCache).length) return Promise.resolve();
+            if (ecmwfLoadPromise) return ecmwfLoadPromise;
+            ecmwfLoadPromise = (async () => {
+                const stored = loadEcmwfFromStorage();
+                if (stored) { ecmwfFieldCache = stored; ecmwfFineCache = {}; return; }
+                const fields = await fetchEcmwfAll();
+                ecmwfFieldCache = fields;
+                ecmwfFineCache = {};
+                saveEcmwfToStorage(fields);
+            })();
+            ecmwfLoadPromise.then(() => { ecmwfLoadPromise = null; }, () => { ecmwfLoadPromise = null; });
+            return ecmwfLoadPromise;
+        }
+
+        // ---- Dettaglio ad alta risoluzione (0,5°) per le precipitazioni su Italia e dintorni ----
+        // Le precipitazioni sono molto irregolari: una griglia da 1,5° le "sfuoca". Sull'area di maggior interesse
+        // si scarica quindi una griglia più fitta, SOLO quando si apre il livello precipitazioni, a blocchi
+        // distanziati (il piano gratuito Open-Meteo concede 600 chiamate/min) e con cache locale di 6 ore.
+        const ECMWF_HR = { latMin: 36, latMax: 48, lonMin: 5, lonMax: 19, step: 0.5, up: 2 };
+        const ECMWF_HR_BOUNDS = [[ECMWF_HR.latMin, ECMWF_HR.lonMin], [ECMWF_HR.latMax, ECMWF_HR.lonMax]];
+        const ECMWF_HR_CACHE_KEY = 'ecmwf_hr_v1';
+        const ECMWF_HR_TTL_MS = 6 * 3600 * 1000;
+        const ECMWF_HR_CHUNK = 100, ECMWF_HR_GAP_MS = 12000, ECMWF_MINUTE_GUARD_MS = 65000, ECMWF_HR_RETRY_MS = 5 * 60 * 1000;
+        const ecmwfHRLats = [], ecmwfHRLons = [];
+        for (let i = 0; i <= Math.round((ECMWF_HR.latMax - ECMWF_HR.latMin) / ECMWF_HR.step); i++) ecmwfHRLats.push(ECMWF_HR.latMax - i * ECMWF_HR.step); // nord->sud
+        for (let j = 0; j <= Math.round((ECMWF_HR.lonMax - ECMWF_HR.lonMin) / ECMWF_HR.step); j++) ecmwfHRLons.push(ECMWF_HR.lonMin + j * ECMWF_HR.step); // ovest->est
+        const ECMWF_HR_SIG = [ECMWF_HR.latMin, ECMWF_HR.latMax, ECMWF_HR.lonMin, ECMWF_HR.lonMax, ECMWF_HR.step].join('_');
+
+        let ecmwfHR = null, ecmwfHRPromise = null, ecmwfHRFailedAt = 0, ecmwfLastBulkEnd = 0;
+        const ecmwfSleep = ms => new Promise(r => setTimeout(r, ms));
+
+        function setEcmwfHRStatus(msg) { const el = document.getElementById('ecmwfHRStatus'); if (el) el.textContent = msg || ''; }
+
+        function loadEcmwfHRFromStorage() {
+            try {
+                const o = JSON.parse(localStorage.getItem(ECMWF_HR_CACHE_KEY) || 'null');
+                if (!o || o.sig !== ECMWF_HR_SIG || (Date.now() - o.ts) > ECMWF_HR_TTL_MS) return null;
+                return { times: o.times, grids: o.grids.map(g => g.map(row => row.map(v => v === null ? NaN : v))) };
+            } catch (e) { return null; }
+        }
+        function saveEcmwfHRToStorage(hr) {
+            try {
+                localStorage.setItem(ECMWF_HR_CACHE_KEY, JSON.stringify({ ts: Date.now(), sig: ECMWF_HR_SIG, times: hr.times,
+                    grids: hr.grids.map(g => g.map(row => row.map(v => Number.isNaN(v) ? null : Math.round(v * 100) / 100))) }));
+            } catch (e) { /* quota piena: si continua senza cache */ }
+        }
+
+        async function fetchEcmwfHR() {
+            const base = ecmwfEndpoint || await pickEcmwfEndpoint();
+            const wait = ECMWF_MINUTE_GUARD_MS - (Date.now() - ecmwfLastBulkEnd);
+            if (ecmwfLastBulkEnd && wait > 0) {
+                setEcmwfHRStatus(`Dettaglio alta risoluzione: attendo ${Math.ceil(wait / 1000)} s per rispettare il limite di richieste...`);
+                await ecmwfSleep(wait);
+            }
+            const points = [];
+            ecmwfHRLats.forEach(lat => ecmwfHRLons.forEach(lon => points.push({ lat, lon })));
+            const nChunks = Math.ceil(points.length / ECMWF_HR_CHUNK);
+            const flat = [];
+            for (let k = 0; k < nChunks; k++) { // blocchi in sequenza e distanziati
+                if (k > 0) await ecmwfSleep(ECMWF_HR_GAP_MS);
+                setEcmwfHRStatus(`Dettaglio alta risoluzione in caricamento: ${k + 1}/${nChunks}`);
+                const ch = points.slice(k * ECMWF_HR_CHUNK, (k + 1) * ECMWF_HR_CHUNK);
+                flat.push(...await ecmwfRequest(ecmwfUrl(base, ch.map(p => p.lat), ch.map(p => p.lon), 3, ['precipitation'])));
+            }
+            if (flat.length !== points.length || !flat[0].hourly) throw new Error('Risposta ECMWF incompleta');
+            const allTimes = flat[0].hourly.time;
+            const nR = ecmwfHRLats.length, nC = ecmwfHRLons.length;
+            const steps = [];
+            for (let t = 0; t < allTimes.length; t += 3) steps.push(t);
+            const grids = steps.map(t => Array.from({ length: nR }, (_, r) => Array.from({ length: nC }, (_, c) => {
+                const v = ecmwfValueAt('precip', flat[r * nC + c].hourly.precipitation, t);
+                return v === null || v === undefined ? NaN : v;
+            })));
+            return { times: steps.map(t => allTimes[t]), grids };
+        }
+
+        function ensureEcmwfHR() {
+            if (ecmwfHR) return Promise.resolve();
+            if (ecmwfHRPromise) return ecmwfHRPromise;
+            ecmwfHRPromise = (async () => {
+                const stored = loadEcmwfHRFromStorage();
+                if (stored) { ecmwfHR = stored; return; }
+                const hr = await fetchEcmwfHR();
+                ecmwfHR = hr;
+                saveEcmwfHRToStorage(hr);
+            })();
+            ecmwfHRPromise.then(() => { ecmwfHRPromise = null; }, () => { ecmwfHRPromise = null; });
+            return ecmwfHRPromise;
+        }
+
+        async function startEcmwfHR() {
+            if (ecmwfHR || ecmwfHRPromise) return;
+            if (ecmwfHRFailedAt && (Date.now() - ecmwfHRFailedAt) < ECMWF_HR_RETRY_MS) return;
+            try {
+                await ensureEcmwfHR();
+                ecmwfHRFailedAt = 0;
+                setEcmwfHRStatus('');
+                ecmwfFineCache = {};
+                if (ecmwfCurrentParam === 'precip') renderEcmwfFrame(ecmwfTimelineIndex);
+            } catch (err) {
+                ecmwfHRFailedAt = Date.now();
+                console.warn('Dettaglio alta risoluzione non disponibile:', err);
+                const limit = err && (err.status === 429 || /limit|too many/i.test(err.message || ''));
+                setEcmwfHRStatus(limit ? 'Dettaglio alta risoluzione non disponibile (limite richieste raggiunto): mostro la griglia standard.'
+                                       : 'Dettaglio alta risoluzione non disponibile: mostro la griglia standard.');
+            }
+        }
+
+        function sampleEcmwfGridBilinear(grid, r, c, nRows, nCols) {
+            const r0 = Math.max(0, Math.min(nRows - 1, Math.floor(r))), c0 = Math.max(0, Math.min(nCols - 1, Math.floor(c)));
+            const r1 = Math.min(nRows - 1, r0 + 1), c1 = Math.min(nCols - 1, c0 + 1);
+            const fr = Math.max(0, Math.min(1, r - r0)), fc = Math.max(0, Math.min(1, c - c0));
+            const v00 = grid[r0][c0], v01 = grid[r0][c1], v10 = grid[r1][c0], v11 = grid[r1][c1];
+            if ([v00, v01, v10, v11].some(v => Number.isNaN(v))) return NaN;
+            return v00 * (1 - fr) * (1 - fc) + v01 * (1 - fr) * fc + v10 * fr * (1 - fc) + v11 * fr * fc;
+        }
+
+        // Interpolazione bicubica (Catmull-Rom): infittisce la griglia mantenendo campi lisci (geopotenziale, temperature)
+        function catmullRom(p0, p1, p2, p3, t) {
+            return p1 + 0.5 * t * (p2 - p0 + t * (2 * p0 - 5 * p1 + 4 * p2 - p3 + t * (3 * (p1 - p2) + p3 - p0)));
+        }
+        function upsampleGridBicubic(grid, up, nonNegative) {
+            const nR = grid.length, nC = grid[0].length;
+            const fR = (nR - 1) * up + 1, fC = (nC - 1) * up + 1;
+            const g = (r, c) => grid[Math.max(0, Math.min(nR - 1, r))][Math.max(0, Math.min(nC - 1, c))];
+            const out = [];
+            for (let i = 0; i < fR; i++) {
+                const r = i / up, r0 = Math.floor(r), tr = r - r0;
+                const row = [];
+                for (let j = 0; j < fC; j++) {
+                    const c = j / up, c0 = Math.floor(c), tc = c - c0;
+                    let bad = false;
+                    const rowVals = [];
+                    for (let dr = -1; dr <= 2; dr++) {
+                        const p = [];
+                        for (let dc = -1; dc <= 2; dc++) { const v = g(r0 + dr, c0 + dc); if (Number.isNaN(v)) bad = true; p.push(v); }
+                        rowVals.push(catmullRom(p[0], p[1], p[2], p[3], tc));
+                    }
+                    let v = bad ? NaN : catmullRom(rowVals[0], rowVals[1], rowVals[2], rowVals[3], tr);
+                    if (!bad) { // niente valori fuori dall'intervallo dei 4 nodi vicini (evita picchi irreali)
+                        const q = [g(r0, c0), g(r0, c0 + 1), g(r0 + 1, c0), g(r0 + 1, c0 + 1)];
+                        const lo = Math.min(...q), hi = Math.max(...q);
+                        if (v < lo) v = lo; else if (v > hi) v = hi;
+                        if (nonNegative && v < 0) v = 0;
+                    }
+                    row.push(v);
+                }
+                out.push(row);
+            }
+            return out;
+        }
+
+        // Marching squares: estrae le linee di contorno (isoipse/isoterme) a un dato livello.
+        // Restituisce segmenti in coordinate di griglia frazionarie [riga, colonna].
+        function marchingSquaresSegments(grid, nRows, nCols, level) {
+            const segments = [];
+            const lerp = (va, vb) => (level - va) / (vb - va);
+            for (let r = 0; r < nRows - 1; r++) {
+                for (let c = 0; c < nCols - 1; c++) {
+                    const tl = grid[r][c], tr = grid[r][c + 1], br = grid[r + 1][c + 1], bl = grid[r + 1][c];
+                    if ([tl, tr, br, bl].some(v => Number.isNaN(v))) continue;
+                    let idx = 0;
+                    if (tl > level) idx |= 8;
+                    if (tr > level) idx |= 4;
+                    if (br > level) idx |= 2;
+                    if (bl > level) idx |= 1;
+                    if (idx === 0 || idx === 15) continue;
+                    const top = [r, c + lerp(tl, tr)], right = [r + lerp(tr, br), c + 1];
+                    const bottom = [r + 1, c + lerp(bl, br)], left = [r + lerp(tl, bl), c];
+                    const seg = (a, b) => segments.push([a, b]);
+                    switch (idx) {
+                        case 1: seg(left, bottom); break;
+                        case 2: seg(bottom, right); break;
+                        case 3: seg(left, right); break;
+                        case 4: seg(top, right); break;
+                        case 5: seg(left, top); seg(bottom, right); break;
+                        case 6: seg(top, bottom); break;
+                        case 7: seg(left, top); break;
+                        case 8: seg(top, left); break;
+                        case 9: seg(top, bottom); break;
+                        case 10: seg(top, right); seg(left, bottom); break;
+                        case 11: seg(top, right); break;
+                        case 12: seg(right, left); break;
+                        case 13: seg(bottom, right); break;
+                        case 14: seg(left, bottom); break;
+                    }
+                }
+            }
+            return segments;
+        }
+
+        const ECMWF_CENTER = [(ECMWF_LAT_MIN + ECMWF_LAT_MAX) / 2, (ECMWF_LON_MIN + ECMWF_LON_MAX) / 2];
+        const geoCoarse = () => ({ latMax: ECMWF_LAT_MAX, lonMin: ECMWF_LON_MIN, lonMax: ECMWF_LON_MAX, latStep: ECMWF_LAT_STEP / ECMWF_UPSAMPLE, lonStep: ECMWF_LON_STEP / ECMWF_UPSAMPLE });
+        const geoHR = () => ({ latMax: ECMWF_HR.latMax, lonMin: ECMWF_HR.lonMin, lonMax: ECMWF_HR.lonMax, latStep: ECMWF_HR.step / ECMWF_HR.up, lonStep: ECMWF_HR.step / ECMWF_HR.up });
+        function gridToLatLon(r, c, geo) { return [geo.latMax - r * geo.latStep, geo.lonMin + c * geo.lonStep]; } // r,c frazionari sulla griglia infittita
+        const inBounds = (lat, lon, b) => lat >= b[0][0] && lat <= b[1][0] && lon >= b[0][1] && lon <= b[1][1];
+
+        let ecmwfContourLayer = null, ecmwfLabelLayer = null;
+
+        // Linee di contorno (e posizioni delle etichette) per una griglia; con skipBounds si escludono i tratti
+        // che cadono nell'area coperta da una griglia più dettagliata.
+        function contourData(grid, nRows, nCols, p, geo, skipBounds) {
+            let minV = Infinity, maxV = -Infinity;
+            for (let r = 0; r < nRows; r++) for (let c = 0; c < nCols; c++) { const v = grid[r][c]; if (!Number.isNaN(v)) { if (v < minV) minV = v; if (v > maxV) maxV = v; } }
+            if (!isFinite(minV)) return { lines: [], labels: [] };
+            let levels = [];
+            if (p.contourLevels) levels = p.contourLevels.filter(l => l >= minV && l <= maxV);
+            else for (let l = Math.ceil(minV / p.contourStep) * p.contourStep; l <= maxV; l += p.contourStep) levels.push(l);
+            const lines = [], labels = [];
+            levels.forEach(level => {
+                const kept = [];
+                marchingSquaresSegments(grid, nRows, nCols, level).forEach(([a, b]) => {
+                    const p1 = gridToLatLon(a[0], a[1], geo), p2 = gridToLatLon(b[0], b[1], geo);
+                    if (skipBounds && inBounds((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2, skipBounds)) return;
+                    kept.push([p1, p2]);
+                });
+                kept.forEach(l => lines.push(l));
+                if (kept.length) {
+                    const picks = kept.length > 60 ? [Math.floor(kept.length * 0.2), Math.floor(kept.length * 0.55), Math.floor(kept.length * 0.85)] : [Math.floor(kept.length / 2)];
+                    picks.forEach(i => labels.push({ latlon: [(kept[i][0][0] + kept[i][1][0]) / 2, (kept[i][0][1] + kept[i][1][1]) / 2], text: String(Number((level / (p.labelDiv || 1)).toFixed(1))) }));
+                }
+            });
+            return { lines, labels };
+        }
+
+        function renderContours(sets, p) {
+            if (ecmwfContourLayer) { ecmwfContourLayer.remove(); ecmwfContourLayer = null; }
+            if (ecmwfLabelLayer) { ecmwfLabelLayer.remove(); ecmwfLabelLayer = null; }
+            if (!ecmwfLeafletMap || (!p.contourStep && !p.contourLevels)) return;
+            const lines = [], labels = [];
+            sets.forEach(st => { const d = contourData(st.grid, st.grid.length, st.grid[0].length, p, st.geo, st.skip); lines.push(...d.lines); labels.push(...d.labels); });
+            // Un'unica polilinea multi-segmento (non migliaia di elementi): molto più veloce da disegnare
+            if (lines.length) ecmwfContourLayer = L.polyline(lines, { color: '#0f172a', weight: p === ECMWF_PARAMS.precip ? 1 : 1.3, opacity: p === ECMWF_PARAMS.precip ? 0.4 : 0.85, interactive: false, smoothFactor: 1 }).addTo(ecmwfLeafletMap);
+            ecmwfLabelLayer = L.layerGroup(labels.map(lb => L.marker(lb.latlon, {
+                icon: L.divIcon({ className: '', html: `<span style="font-size:10px;font-weight:700;color:#fff;background:rgba(15,23,42,${p === ECMWF_PARAMS.precip ? 0.5 : 0.85});padding:0 3px;border-radius:4px;white-space:nowrap;transform:translate(-50%,-50%);display:inline-block;">${lb.text}</span>`, iconSize: [0, 0] }),
+                interactive: false
+            }))).addTo(ecmwfLeafletMap);
+        }
+
+        function renderLegend(param) {
+            const legendEl = document.getElementById('ecmwfLegend');
+            if (!legendEl) return;
+            const p = ECMWF_PARAMS[param];
+            const posOf = v => { let n = (v - p.vmin) / (p.vmax - p.vmin); n = Math.max(0, Math.min(1, n)); return (p.lutPow ? Math.pow(n, p.lutPow) : n) * 100; };
+            const stops = p.stops.filter((s, i, arr) => i === arr.length - 1 || s[0] !== arr[i + 1][0]); // soglie duplicate: si tiene quella colorata
+            const gradientCss = stops.map(s => `rgba(${Math.round(s[1][0])},${Math.round(s[1][1])},${Math.round(s[1][2])},${(s[1][3] / 255).toFixed(2)}) ${posOf(s[0]).toFixed(1)}%`).join(', ');
+            const ticks = p.ticks.map(t => `<span style="position:absolute;left:${posOf(t).toFixed(1)}%;transform:translateX(-50%);">${t}</span>`).join('');
+            legendEl.innerHTML = `
+                <div class="h-2.5 rounded-full border border-white/20" style="background: linear-gradient(90deg, ${gradientCss});"></div>
+                <div class="relative h-3.5 mt-0.5 text-[10px] text-slate-300 mx-2">${ticks}</div>
+                <p class="text-[10px] text-slate-400">${p.unit} · ${p.note} · Tocca la mappa per leggere il valore.</p>`;
+        }
+
+        let ecmwfCurrentFine = null, ecmwfCurrentHRFine = null;
+        function onEcmwfMapClick(e) {
+            const lat = e.latlng.lat, lon = e.latlng.lng;
+            let grid = ecmwfCurrentFine, geo = geoCoarse();
+            if (ecmwfCurrentHRFine && inBounds(lat, lon, ECMWF_HR_BOUNDS)) { grid = ecmwfCurrentHRFine; geo = geoHR(); }
+            if (!grid) return;
+            const gr = (geo.latMax - lat) / geo.latStep, gc = (lon - geo.lonMin) / geo.lonStep;
+            if (gr < 0 || gc < 0 || gr > grid.length - 1 || gc > grid[0].length - 1) return;
+            const v = sampleEcmwfGridBilinear(grid, gr, gc, grid.length, grid[0].length);
+            if (Number.isNaN(v)) return;
+            const p = ECMWF_PARAMS[ecmwfCurrentParam];
+            L.popup({ closeButton: false }).setLatLng(e.latlng)
+                .setContent(`<div style="font-size:12px;"><b>${(Math.round(v * 10) / 10)} ${p.unit}</b><br><span style="color:#64748b">${p.label}</span></div>`)
+                .openOn(ecmwfLeafletMap);
+        }
+
+        // La mappa non può uscire dall'area coperta dai dati e non si può zoomare più indietro di quanto serve
+        // a riempire il riquadro: fuori dall'area la base apparirebbe senza i livelli sopra.
+        function fitEcmwfMapToBounds(reset) {
+            const m = ecmwfLeafletMap;
+            if (!m) return;
+            m.invalidateSize();
+            const z = m.getBoundsZoom(ECMWF_BOUNDS, true);
+            m.setMinZoom(z);
+            m.setMaxBounds(ECMWF_BOUNDS);
+            if (reset || m.getZoom() < z) m.setView(ECMWF_CENTER, z, { animate: false });
+        }
+
+        function ensureEcmwfMap() {
+            if (ecmwfLeafletMap) return;
+            const container = document.getElementById('ecmwfMapContainer');
+            if (!container || typeof L === 'undefined') return;
+            ecmwfLeafletMap = L.map('ecmwfMapContainer', { center: ECMWF_CENTER, zoom: 4, minZoom: 3, maxZoom: 9, zoomSnap: 0.25, zoomDelta: 0.5, maxBoundsViscosity: 1.0, zoomControl: true, attributionControl: false });
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(ecmwfLeafletMap);
+            // Base in scala di grigi SOPRA i colori con fusione "multiply": coste, confini e nomi restano ben visibili
+            // attraverso il riempimento colorato (prima i livelli coprivano completamente la mappa sottostante).
+            const supportsBlend = typeof CSS !== 'undefined' && CSS.supports && CSS.supports('mix-blend-mode', 'multiply');
+            if (supportsBlend) {
+                const tp = ecmwfLeafletMap.getPane('tilePane');
+                tp.style.zIndex = 450;
+                tp.style.mixBlendMode = 'multiply';
+                tp.style.filter = 'grayscale(1) contrast(1.25) brightness(1.08)';
+            }
+            ecmwfOverlayOpacity = supportsBlend ? 0.85 : 0.55;
+            ecmwfLeafletMap.on('click', onEcmwfMapClick);
+            fitEcmwfMapToBounds(true);
+            window.addEventListener('resize', () => fitEcmwfMapToBounds(false));
+        }
+
+        const mercY = lat => Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2));
+        const invMercY = y => (2 * Math.atan(Math.exp(y)) - Math.PI / 2) * 180 / Math.PI;
+
+        let ecmwfFineCache = {};          // 'tipo|parametro|indice' -> griglia infittita
+        let ecmwfImageOverlayHR = null, ecmwfOverlayOpacity = 0.85;
+        const ecmwfCanvases = {};
+
+        function getEcmwfFine(param, idx) {
+            const key = 'c|' + param + '|' + idx;
+            if (!ecmwfFineCache[key]) ecmwfFineCache[key] = upsampleGridBicubic(ecmwfFieldCache[param].grids[idx], ECMWF_UPSAMPLE, param === 'precip');
+            return ecmwfFineCache[key];
+        }
+        function getEcmwfFineHR(hrIdx) {
+            const key = 'h|' + hrIdx;
+            if (!ecmwfFineCache[key]) ecmwfFineCache[key] = upsampleGridBicubic(ecmwfHR.grids[hrIdx], ECMWF_HR.up, true);
+            return ecmwfFineCache[key];
+        }
+
+        // Raster piccolo allineato alla proiezione Mercator di Leaflet; il browser lo ingrandisce con interpolazione.
+        // maskBounds: area lasciata trasparente (coperta da una griglia più dettagliata).
+        function rasterizeEcmwf(fine, geo, p, pxPerCell, canvasKey, maskBounds) {
+            const fRows = fine.length, fCols = fine[0].length;
+            const latMin = geo.latMax - (fRows - 1) * geo.latStep;
+            const W = fCols * pxPerCell;
+            const yMax = mercY(geo.latMax), yMin = mercY(latMin);
+            const H = Math.round(W * (yMax - yMin) / ((geo.lonMax - geo.lonMin) * Math.PI / 180));
+            const canvas = ecmwfCanvases[canvasKey] || (ecmwfCanvases[canvasKey] = document.createElement('canvas'));
+            canvas.width = W; canvas.height = H;
+            const ctx = canvas.getContext('2d');
+            const imgData = ctx.createImageData(W, H);
+            const data = imgData.data, lut = p.lut, vmin = p.vmin, range = p.vmax - p.vmin;
+            const colLon = new Float32Array(W), colPos = new Float32Array(W);
+            for (let px = 0; px < W; px++) { colLon[px] = geo.lonMin + (px + 0.5) / W * (geo.lonMax - geo.lonMin); colPos[px] = (colLon[px] - geo.lonMin) / geo.lonStep; }
+            for (let py = 0; py < H; py++) {
+                const lat = invMercY(yMax - (py + 0.5) / H * (yMax - yMin));
+                const gr = (geo.latMax - lat) / geo.latStep;
+                const rowMasked = maskBounds && lat >= maskBounds[0][0] && lat <= maskBounds[1][0];
+                for (let px = 0; px < W; px++) {
+                    if (rowMasked && colLon[px] >= maskBounds[0][1] && colLon[px] <= maskBounds[1][1]) continue;
+                    const v = sampleEcmwfGridBilinear(fine, gr, colPos[px], fRows, fCols);
+                    if (Number.isNaN(v)) continue;
+                    let n = (v - vmin) / range; n = n < 0 ? 0 : (n > 1 ? 1 : n);
+                    if (p.lutPow) n = Math.pow(n, p.lutPow);
+                    const k = Math.round(n * (ECMWF_LUT_N - 1)) * 4, o = (py * W + px) * 4;
+                    data[o] = lut[k]; data[o + 1] = lut[k + 1]; data[o + 2] = lut[k + 2]; data[o + 3] = lut[k + 3];
+                }
+            }
+            ctx.putImageData(imgData, 0, 0);
+            return canvas.toDataURL();
+        }
+
+        function renderEcmwfFrame(index) {
+            const cached = ecmwfFieldCache[ecmwfCurrentParam];
+            if (!cached || !cached.grids.length) return;
+            const idx = Math.max(0, Math.min(cached.grids.length - 1, index));
+            const p = ECMWF_PARAMS[ecmwfCurrentParam];
+            const fine = getEcmwfFine(ecmwfCurrentParam, idx);
+            const hrIdx = (ecmwfCurrentParam === 'precip' && ecmwfHR) ? ecmwfHR.times.indexOf(cached.times[idx]) : -1;
+            const useHR = hrIdx >= 0;
+            const fineHR = useHR ? getEcmwfFineHR(hrIdx) : null;
+            ecmwfCurrentFine = fine; ecmwfCurrentHRFine = fineHR;
+
+            const urlCoarse = rasterizeEcmwf(fine, geoCoarse(), p, 2, 'coarse', useHR ? ECMWF_HR_BOUNDS : null);
+            const urlHR = useHR ? rasterizeEcmwf(fineHR, geoHR(), p, 3, 'hr', null) : null;
+
+            ensureEcmwfMap();
+            if (ecmwfLeafletMap) {
+                if (ecmwfImageOverlay) { ecmwfImageOverlay.setUrl(urlCoarse); }
+                else { ecmwfImageOverlay = L.imageOverlay(urlCoarse, ECMWF_BOUNDS, { opacity: ecmwfOverlayOpacity, interactive: false }).addTo(ecmwfLeafletMap); }
+                if (useHR) {
+                    if (ecmwfImageOverlayHR) { ecmwfImageOverlayHR.setUrl(urlHR); }
+                    else { ecmwfImageOverlayHR = L.imageOverlay(urlHR, ECMWF_HR_BOUNDS, { opacity: ecmwfOverlayOpacity, interactive: false }).addTo(ecmwfLeafletMap); }
+                } else if (ecmwfImageOverlayHR) { ecmwfImageOverlayHR.remove(); ecmwfImageOverlayHR = null; }
+                const sets = [{ grid: fine, geo: geoCoarse(), skip: useHR ? ECMWF_HR_BOUNDS : null }];
+                if (useHR) sets.push({ grid: fineHR, geo: geoHR(), skip: null });
+                renderContours(sets, p);
+            }
+            renderLegend(ecmwfCurrentParam);
+            if (!ecmwfHRPromise) {
+                if (ecmwfCurrentParam === 'precip' && ecmwfHR) setEcmwfHRStatus(useHR ? 'Dettaglio 0,5° attivo su Italia e dintorni (36-48°N, 5-19°E)' : 'Oltre i 3 giorni: griglia standard 2°');
+                else if (ecmwfCurrentParam !== 'precip') setEcmwfHRStatus('');
+            }
+
+            const label = document.getElementById('ecmwfTimeLabel');
+            if (label) {
+                const t = new Date(cached.times[idx] + 'Z');
+                label.innerText = `${t.toLocaleDateString('it-IT', { weekday: 'short', day: '2-digit', month: '2-digit' })} ${t.getHours().toString().padStart(2, '0')}:00`;
+            }
+        }
+
+        function setEcmwfOverlay(state, msg) {
+            const el = document.getElementById('ecmwfLoadingOverlay');
+            if (!el) return;
+            if (state === 'hidden') { el.classList.add('hidden'); return; }
+            el.classList.remove('hidden');
+            if (state === 'loading') { el.innerHTML = 'Caricamento dati ECMWF...'; return; }
+            el.innerHTML = `<div class="text-center px-4"><p class="mb-2 leading-snug">${msg}</p><button id="ecmwfRetryBtn" class="px-3 py-1 rounded-lg bg-sky-500/30 border border-white/20 text-sky-100">Riprova</button></div>`;
+            const btn = document.getElementById('ecmwfRetryBtn');
+            if (btn) btn.onclick = () => loadEcmwfParam(ecmwfCurrentParam);
+        }
+
+        async function loadEcmwfParam(param) {
+            ecmwfCurrentParam = param;
+            const slider = document.getElementById('ecmwfSlider');
+            try {
+                if (!Object.keys(ecmwfFieldCache).length) {
+                    setEcmwfOverlay('loading');
+                    await ensureEcmwfData();
+                }
+                const field = ecmwfFieldCache[param];
+                if (!field) throw new Error('Parametro non disponibile');
+                const nowIdx = Math.max(0, field.times.findIndex(t => new Date(t + 'Z').getTime() + 3 * 3600000 > Date.now()));
+                if (!ecmwfStartedNow) { ecmwfTimelineIndex = nowIdx; ecmwfStartedNow = true; }
+                ecmwfTimelineIndex = Math.max(nowIdx, Math.min(ecmwfTimelineIndex, field.grids.length - 1));
+                if (slider) { slider.min = nowIdx; slider.max = field.grids.length - 1; slider.value = ecmwfTimelineIndex; }
+                setEcmwfOverlay('hidden');
+                renderEcmwfFrame(ecmwfTimelineIndex);
+                if (param === 'precip') startEcmwfHR(); // in background: la mappa standard resta subito utilizzabile
+            } catch (err) {
+                console.error('Errore caricamento mappa ECMWF:', err);
+                const limit = err && (err.status === 429 || /limit|too many/i.test(err.message || ''));
+                setEcmwfOverlay('error', limit
+                    ? 'Limite richieste Open-Meteo raggiunto (piano gratuito). Riprova tra qualche minuto.'
+                    : `Dati non disponibili${err && err.message ? ': ' + err.message : ''}`);
+            }
+        }
+
+        function setupEcmwfMapControls() {
+            const select = document.getElementById('ecmwfParamSelect');
+            const slider = document.getElementById('ecmwfSlider');
+            if (!select || !slider) return;
+            select.addEventListener('change', () => loadEcmwfParam(select.value));
+            let rafPending = false;
+            slider.addEventListener('input', () => {
+                ecmwfTimelineIndex = parseInt(slider.value, 10);
+                if (rafPending) return; // accorpa gli eventi: un solo ridisegno per frame di animazione
+                rafPending = true;
+                requestAnimationFrame(() => { rafPending = false; renderEcmwfFrame(ecmwfTimelineIndex); });
+            });
+        }
 
         function getSVGIcon(type, sizeClass = "w-8 h-8", isNight = false) {
             if (isNight) {
@@ -1051,7 +1727,14 @@
                 } catch (e) {}
             }
             fetchWeatherForLocation(currentLat, currentLon, currentCityName);
-            setupSearch(); setupGeoLocation(); setupModalEvents(); setupSavedLocationsModal();
+            setupSearch(); setupGeoLocation(); setupModalEvents(); setupSavedLocationsModal(); setupEcmwfMapControls();
+            const ecmwfWrap = document.getElementById('ecmwfMapWrap');
+            if ('IntersectionObserver' in window && ecmwfWrap) {
+                const io = new IntersectionObserver(entries => {
+                    if (entries.some(e => e.isIntersecting)) { io.disconnect(); loadEcmwfParam(ecmwfCurrentParam); }
+                }, { rootMargin: '200px' });
+                io.observe(ecmwfWrap);
+            } else { loadEcmwfParam(ecmwfCurrentParam); }
 
             const handleAutoRefresh = () => { if (Date.now() - lastFetchTimestamp > 60000) { showToast("Aggiornamento previsioni in corso..."); fetchWeatherForLocation(currentLat, currentLon, currentCityName); } };
             document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') handleAutoRefresh(); });
@@ -1291,9 +1974,10 @@
                 if (i === currentHourIndex) { nowModelResult = hailRes; nowCape = cape; nowPrecip = precip; }
                 if (hailRes.hsr_final > maxProb) { maxProb = hailRes.hsr_final; peakObj = { index: i, date: new Date(data.hourly.time[i]), cape, cin, precip, result: hailRes }; }
 
-                if (hailRes.rare_event && hailRes.rare_event.flag) {
-                    if (!peakRareObj || hailRes.rare_event.index > peakRareObj.result.rare_event.index || (hailRes.rare_event.potential_size || 0) > (peakRareObj.result.rare_event.potential_size || 0)) {
-                        peakRareObj = { index: i, date: new Date(data.hourly.time[i]), cape, cin, precip, result: hailRes };
+                if (hailRes.rare_event) {
+                    const rPct = hailRiskOver3cmPercent(hailRes.hsr_final, hailRes.rare_event);
+                    if (rPct > 3 && (!peakRareObj || rPct > peakRareObj.pct)) {
+                        peakRareObj = { index: i, date: new Date(data.hourly.time[i]), cape, cin, precip, result: hailRes, pct: rPct };
                     }
                 }
             }
@@ -1307,10 +1991,20 @@
                 const nowClass = classifyFinalRisk(nowFusion.hsr_final);
                 lastNowFusion = { fusion: nowFusion, modelResult: nowModelResult, radarState: currentRadarState, cape: nowCape, classification: nowClass };
 
+                const hailRiskEl = document.getElementById('hailRisk3cm');
+                if (hailRiskEl) {
+                    const riskPct = hailRiskOver3cmPercent(nowFusion.hsr_final, nowModelResult ? nowModelResult.rare_event : null);
+                    hailRiskEl.innerText = `${riskPct}%`;
+                    hailRiskEl.className = 'text-sm font-bold ' + (riskPct >= 50 ? 'text-red-400' : riskPct >= 20 ? 'text-amber-300' : 'text-sky-100');
+                }
+
                 // Alert Rischio Grandine Standard (HSR) — privilegia il dato "adesso" fuso col radar se supera il picco previsto
                 const showNow = nowModelResult && nowFusion.hsr_final >= maxProb;
                 const displayVal = showNow ? nowFusion.hsr_final : maxProb;
-                if (displayVal >= 0.35 && (showNow || peakObj)) {
+                const alertRiskPct = showNow
+                    ? hailRiskOver3cmPercent(nowFusion.hsr_final, nowModelResult ? nowModelResult.rare_event : null)
+                    : (peakObj ? hailRiskOver3cmPercent(peakObj.result.hsr_final, peakObj.result.rare_event) : 0);
+                if (displayVal >= 0.35 && (showNow || peakObj) && alertRiskPct > 3) {
                     if (showNow) {
                         alertText.innerHTML = `<p class="font-semibold text-amber-100">Adesso (radar+modello): <span class="text-white font-bold">${Math.round(nowFusion.hsr_final * 100)}%</span> — ${nowClass.label}</p>
                                                <p class="text-amber-200/90 font-medium">${currentRadarState && currentRadarState.available ? `Zmax radar: ${currentRadarState.zmax} dBZ` : 'Nessuna eco radar significativa, stima da soli dati atmosferici'}</p>`;
@@ -1326,7 +2020,7 @@
                 console.error('Errore nella fusione HSR_FINAL, uso solo il modello atmosferico:', fusionErr);
                 lastNowFusion = null;
                 // Fallback: comportamento identico alla versione solo-atmosferica
-                if (maxProb >= 0.35 && peakObj) {
+                if (maxProb >= 0.35 && peakObj && hailRiskOver3cmPercent(peakObj.result.hsr_final, peakObj.result.rare_event) > 3) {
                     const timeStr = peakObj.date.toLocaleDateString('it-IT', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
                     alertText.innerHTML = `<p class="font-semibold text-amber-100">Picco stimato: <span class="text-white">${timeStr}</span> (HSR: <span class="text-white font-bold">${Math.round(maxProb * 100)}%</span>)</p>
                                            <p class="text-amber-200/90 font-medium">${peakObj.result.label} - Chicchi stimati: ~${peakObj.result.estSize} cm</p>`;
@@ -1337,13 +2031,13 @@
 
             // Alert Separato Evento Raro (>4 cm)
             if (rareCard && rareText) {
-                if (peakRareObj && peakRareObj.result.rare_event && peakRareObj.result.rare_event.flag) {
+                if (peakRareObj && peakRareObj.result.rare_event && hailRiskOver3cmPercent(peakRareObj.result.hsr_final, peakRareObj.result.rare_event) > 3) {
                     const rTimeStr = peakRareObj.date.toLocaleDateString('it-IT', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
                     const rEvt = peakRareObj.result.rare_event;
                     const levelBadge = rEvt.level === "extreme" ? "ESTREMO" : (rEvt.level === "high" ? "ALTO" : "ELEVATO");
                     rareText.innerHTML = `
                         <p class="font-bold text-red-100">Finestra stimata: <span class="text-white">${rTimeStr}</span> (Livello: <span class="text-white font-extrabold uppercase">${levelBadge} - ${rEvt.index}/8</span>)</p>
-                        <p class="text-red-200/95 font-medium">Potenziale chicchi: <span class="text-white font-extrabold">~${rEvt.potential_size} cm</span> - Condizioni per supercella / grandine distruttiva.</p>
+                        <p class="text-red-200/95 font-medium">${rEvt.potential_size ? `Potenziale chicchi: <span class="text-white font-extrabold">~${rEvt.potential_size} cm</span> - Condizioni per supercella / grandine distruttiva.` : 'Condizioni atmosferiche favorevoli a grandine di grosse dimensioni.'}</p>
                     `;
                     rareCard.classList.remove('hidden');
                 } else {
@@ -1529,9 +2223,36 @@
             let maxCape = null, maxCin = null, maxShear = null, minFrz = null, maxDew = null;
             let sumZ500 = 0, validZ = 0;
             let sumHum = 0, sumPress = 0, validHP = 0;
+            let dayMaxHsr = 0, dayRareEvent = null;
 
             for (let i = startIndex; i < endIndex && i < currentWeatherData.hourly.time.length; i++) {
                 const hData = currentWeatherData.hourly;
+
+                // Rischio grandine >3 cm per quest'ora, con lo stesso algoritmo usato per l'alert
+                {
+                    const cape = hData.cape ? (hData.cape[i] || 0) : 0;
+                    const cin = hData.convective_inhibition ? (hData.convective_inhibition[i] || 0) : 0;
+                    const freezing = hData.freezing_level_height ? (hData.freezing_level_height[i] || undefined) : undefined;
+                    const t700 = hData.temperature_700hPa ? hData.temperature_700hPa[i] : undefined;
+                    const t500 = hData.temperature_500hPa ? hData.temperature_500hPa[i] : undefined;
+                    const z700 = hData.geopotential_height_700hPa ? hData.geopotential_height_700hPa[i] : undefined;
+                    const z500h = hData.geopotential_height_500hPa ? hData.geopotential_height_500hPa[i] : undefined;
+                    const precip = hData.precipitation ? (hData.precipitation[i] || 0) : 0;
+                    const wind10 = hData.wind_speed_10m ? (hData.wind_speed_10m[i] || 10) : 10;
+                    const wind80 = hData.wind_speed_80m ? (hData.wind_speed_80m[i] || (wind10 * 1.5)) : (wind10 * 1.5);
+                    const fallback_shear = Number(((wind80 - wind10) * 0.28).toFixed(1)) + 10;
+                    let u850, v850, u500, v500;
+                    if (hData.wind_speed_850hPa !== undefined && hData.wind_direction_850hPa !== undefined) {
+                        const ws = hData.wind_speed_850hPa[i] / 3.6, wd = hData.wind_direction_850hPa[i] * (Math.PI / 180);
+                        u850 = -ws * Math.sin(wd); v850 = -ws * Math.cos(wd);
+                    }
+                    if (hData.wind_speed_500hPa !== undefined && hData.wind_direction_500hPa !== undefined) {
+                        const ws = hData.wind_speed_500hPa[i] / 3.6, wd = hData.wind_direction_500hPa[i] * (Math.PI / 180);
+                        u500 = -ws * Math.sin(wd); v500 = -ws * Math.cos(wd);
+                    }
+                    const hRes = calculateHailIndex({ cape, cin, u850, v850, u500, v500, t700, t500, z700, z500: z500h, freezing_level: freezing, precip, fallback_shear });
+                    if (hRes.hsr_final > dayMaxHsr) { dayMaxHsr = hRes.hsr_final; dayRareEvent = hRes.rare_event; }
+                }
                 
                 if (hData.cape && hData.cape[i] !== undefined && hData.cape[i] !== null) {
                     if (maxCape === null || hData.cape[i] > maxCape) maxCape = hData.cape[i];
@@ -1590,8 +2311,9 @@
             const cZ500Cls = validZ > 0 ? cZ500(Math.round(sumZ500 / validZ / 10)) : "text-white font-normal";
             const unitZ500 = validZ > 0 ? `<span class="text-[9px] font-normal opacity-70">dam</span>` : "";
             
-            const fHum = validHP > 0 ? Math.round(sumHum / validHP) + "%" : "n.d.";
-            const cHumCls = validHP > 0 ? "text-sky-100" : "text-white font-normal";
+            const hailRiskDayPct = hailRiskOver3cmPercent(dayMaxHsr, dayRareEvent);
+            const fHailRisk = `${hailRiskDayPct}%`;
+            const cHailRiskCls = hailRiskDayPct >= 50 ? "text-red-400" : hailRiskDayPct >= 20 ? "text-amber-300" : "text-sky-100";
             
             const fPress = validHP > 0 ? Math.round(sumPress / validHP) : "n.d.";
             const unitPress = validHP > 0 && fPress !== "n.d." ? `<span class="text-[9px] font-normal opacity-70">hPa</span>` : "";
@@ -1624,8 +2346,8 @@
                         <span class="text-xs sm:text-sm font-bold ${cZ500Cls}">${fZ500} ${unitZ500}</span>
                     </div>
                     <div class="flex flex-col items-center p-1.5 rounded-lg bg-black/30 border border-white/5 text-center shadow-sm">
-                        <span class="text-[9px] sm:text-[10px] text-white/60 uppercase font-medium">Umidità</span>
-                        <span class="text-xs sm:text-sm font-bold ${cHumCls}">${fHum}</span>
+                        <span class="text-[9px] sm:text-[10px] text-white/60 uppercase font-medium leading-tight">Grandine<br>&gt;3cm</span>
+                        <span class="text-xs sm:text-sm font-bold ${cHailRiskCls}">${fHailRisk}</span>
                     </div>
                     <div class="flex flex-col items-center p-1.5 rounded-lg bg-black/30 border border-white/5 text-center shadow-sm">
                         <span class="text-[9px] sm:text-[10px] text-white/60 uppercase font-medium">Press.</span>
